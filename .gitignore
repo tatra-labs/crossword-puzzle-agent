@@ -32,3 +32,10 @@ htmlcov/
 .DS_Store
 Thumbs.db
 data/lexicon/words_alpha.txt
+
+# Frame directory created by scripts/record-demo.js
+.demo-frames/
+
+# scripts/record-demo.js needs puppeteer-core; npm puts it here
+node_modules/
+package-lock.json

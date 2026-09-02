@@ -18,6 +18,22 @@ itself**.
 
 ---
 
+## See it run
+
+![The studio UI solving a 7x7: the grid fills in while the trace on the right shows a model call expanded into the prompt as sent and the tool call that came back, ending on 37/37 squares for $0.01](docs/demo.gif)
+
+Eighteen seconds of highlights, straight out of the full recording below. Nothing is
+staged: this is `midi-01` being solved on `claude-sonnet-5` — 37/37 squares in 8.7s on 2
+real API calls for $0.0121 — with the prompts and tool calls it actually sent.
+
+**The full minute: [docs/demo.mp4](docs/demo.mp4)** (57s, 2 MB, captions on screen, no
+audio). It is a recording rather than a reconstruction — `scripts/record-demo.js` drives
+the real page in headless Chrome and captures what the browser paints, with frames
+encoded at their wall-clock durations, so video time equals real time. Regenerate it with
+`node scripts/record-demo.js` ([how](docs/VIDEO_SCRIPT.md)).
+
+---
+
 ## Why this isn't just a prompt
 
 Hand a language model 76 crossword clues and it returns 76 confident answers that don't
