@@ -464,6 +464,20 @@ def health() -> JSONResponse:
             # the deployment's whole budget, which made the bypass invisible in
             # the one place someone would look for it.
             "active_solves": _admission.live,
+            # Which Vercel environment this is ("production"/"preview"/
+            # "development"), empty when running locally. Worth reporting
+            # because the first deployment came up with api_key_configured
+            # false while the dashboard showed the key set, and the two
+            # questions -- is a key reaching the process, and which
+            # environment's variables am I looking at -- could not be told
+            # apart from outside.
+            "vercel_env": os.environ.get("VERCEL_ENV", ""),
+            # Whether the *process environment* carries the key, as distinct
+            # from `api_key_configured`, which is true if either the
+            # environment or a local .env supplies one. On a deployment there
+            # is no .env, so a disagreement here means the platform is not
+            # injecting the variable rather than the key being wrong.
+            "api_key_in_environment": bool(os.environ.get("ANTHROPIC_API_KEY")),
             "python": sys.version.split()[0],
         }
     )
@@ -995,11 +1009,23 @@ def _static(name: str) -> Response:
     return Response(path.read_bytes(), media_type=_STATIC_FILES[name])
 
 
+# Both the root and the /static/ path, deliberately.
+#
+# Vercel treats a top-level ``public/`` directory as the static output: it
+# serves those files from the CDN at the root and hoists them out of the
+# function's filesystem. So on a deployment ``/studio.css`` is a cached CDN hit
+# that never wakes this function, while ``/static/studio.css`` is a file the
+# function can no longer open -- which is exactly how the first deployment
+# shipped a page whose CSS and JS both 404'd. The page therefore links the root
+# paths, and these routes exist so that the same page works when uvicorn is
+# serving it locally, where nothing hoists anything.
+@app.get("/studio.css")
 @app.get("/static/studio.css")
 def studio_css() -> Response:
     return _static("studio.css")
 
 
+@app.get("/studio.js")
 @app.get("/static/studio.js")
 def studio_js() -> Response:
     return _static("studio.js")

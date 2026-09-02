@@ -1,7 +1,12 @@
 # NEVER upload secrets. The API key is supplied as a Vercel environment
 # variable, not from a file in the bundle.
-.env
+#
+# The glob matters: a bare `.env` matches only that exact name, and
+# `vercel link` writes a `.env.local` holding a VERCEL_OIDC_TOKEN, which an
+# exact-match rule would have shipped inside the function.
+.env*
 *.key
+.vercel/
 
 # Local environments. These are gitignored, but .vercelignore is what the CLI
 # reads, so leaving them out here uploads them: a .venv from `pip install -e .`

@@ -5,10 +5,5 @@
       "maxDuration": 300,
       "excludeFiles": "{tests/**,reports/**,docs/**,scripts/**,data/puzzles/nyt/**,data/lexicon/**,.xword-cache/**,**/__pycache__/**,src/*.egg-info/**}"
     }
-  },
-  "env": {
-    "XWORD_CACHE_DIR": "/tmp/xword-cache",
-    "XWORD_REPORT_DIR": "/tmp/xword-reports",
-    "XWORD_FUNCTION_MAX_SECONDS": "300"
   }
 }
