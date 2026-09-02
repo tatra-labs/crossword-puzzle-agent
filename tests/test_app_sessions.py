@@ -70,7 +70,12 @@ from xword.core.types import (  # noqa: E402
     SolveStats,
 )
 from xword.web.sessions import SessionInfo, SessionLimit, SessionManager  # noqa: E402
-from xword.web.trace import TERMINAL_STATES, LLMCallRecord, TraceLog  # noqa: E402
+from xword.web.trace import (  # noqa: E402
+    TERMINAL_STATES,
+    LLMCallRecord,
+    TraceEvent,
+    TraceLog,
+)
 
 BLOCK = "#"
 
@@ -134,6 +139,17 @@ SESSION_FIELDS: tuple[str, ...] = (
     "solved",
     "cells_correct",
     "cells_total",
+)
+
+#: The session read routes. They are guarded like the mutating ones: a trace
+#: holds the prompts, the answers and the cost of work someone else paid for,
+#: and the listing is where the ids come from, so an open read route made the
+#: token a spend guard in name only.
+SESSION_READ_PATHS: tuple[str, ...] = (
+    "/api/sessions",
+    "/api/sessions/s1",
+    "/api/sessions/s1/events",
+    "/api/sessions/s1/stream",
 )
 
 
@@ -259,6 +275,60 @@ class FakeManager:
         return self.active_value
 
 
+class _LateFinishLog(TraceLog):
+    """A log whose solve lands in the gap after ``wait_since`` has timed out.
+
+    The interleaving is not exotic. ``wait_since`` returns ``[]`` on timeout
+    while the log is still open; the coroutine's resumption then queues behind
+    whatever else the event loop is servicing (other streams, the sidebar
+    polls); and in that window the solve thread appends ``result``, appends the
+    terminal ``status`` and closes. Anything that reads ``closed`` *after* the
+    wait declares the stream over and drops exactly those two events.
+
+    Scripting the window here rather than racing two real threads is what makes
+    the test deterministic: with real timing the loss reproduced roughly one run
+    in ten, which is the wrong kind of regression test.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.waits = 0
+
+    def wait_since(self, cursor: int, timeout: float) -> list[TraceEvent]:
+        self.waits += 1
+        # Timeout is forced to zero so the test does not pay for it; the
+        # observable behaviour -- empty return, log still open -- is identical.
+        pending = super().wait_since(cursor, 0.0)
+        if self.waits == 1:
+            self.append("result", {"puzzle": {"id": "mini-01"}})
+            self.append("status", {"state": "done", "message": "finished"})
+            self.close()
+        return pending
+
+
+class _LateFinishSliceLog(TraceLog):
+    """A log whose solve lands while the events poll is taking its slice.
+
+    Same hazard as :class:`_LateFinishLog`, one route over: the poll answers
+    with an events array and a ``closed`` flag, and if the flag is sampled after
+    the slice it can say ``true`` about a log the array predates. The client
+    stops polling with the result still on the server.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.slices = 0
+
+    def since(self, cursor: int) -> list[TraceEvent]:
+        self.slices += 1
+        events = super().since(cursor)
+        if self.slices == 1:
+            self.append("result", {"puzzle": {"id": "mini-01"}})
+            self.append("status", {"state": "done", "message": "finished"})
+            self.close()
+        return events
+
+
 class StubAgent:
     """Narrates a solve without making one, so a session can finish for free.
 
@@ -354,6 +424,20 @@ def manager(monkeypatch: pytest.MonkeyPatch) -> FakeManager:
     fake = FakeManager()
     monkeypatch.setattr(webapp, "manager", fake)
     return fake
+
+
+@pytest.fixture
+def admission(monkeypatch: pytest.MonkeyPatch) -> webapp._SolveAdmission:
+    """A fresh concurrency gate per test.
+
+    The real one is module state on purpose -- an in-request solve holds its
+    slot until its worker thread ends, which is later than the response -- so a
+    test that filled it would shrink the cap for every test after it. Replacing
+    the object is cleaner than reaching into its counter.
+    """
+    gate = webapp._SolveAdmission()
+    monkeypatch.setattr(webapp, "_admission", gate)
+    return gate
 
 
 @pytest.fixture
@@ -694,6 +778,106 @@ def test_create_session_is_429_when_the_cap_is_reached(
     assert response.json()["detail"] == manager.limit_message
 
 
+@pytest.mark.parametrize("path", ["/api/solve", "/api/solve/stream"])
+def test_the_legacy_solve_routes_honour_the_same_cap_as_a_session(
+    client: TestClient,
+    manager: FakeManager,
+    admission: webapp._SolveAdmission,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+) -> None:
+    """The cap is a spend guard, so it has to cover every way to spend.
+
+    Before this, three sessions filled the cap while twenty parallel
+    ``/api/solve/stream`` requests ran unbounded -- identical work, identical
+    price, one uncancellable thread each -- so the guard was one endpoint away
+    from being decorative.
+    """
+    monkeypatch.setattr(cfg, "api_key", lambda: "test-key")
+    manager.active_value = webapp.MAX_CONCURRENT_SESSIONS  # the cap is full
+    response = client.post(path, json={"puzzle": "mini-01"})
+    assert response.status_code == 429
+    detail = response.json()["detail"]
+    assert "spend guard" in detail
+    # The refusal names the routes it covers, because "3 sessions at once"
+    # reads like an invitation to use the other endpoint.
+    assert "/api/solve/stream" in detail
+    # Refused before any agent was built: ForbiddenAgent would have raised
+    # loudly, and no slot was taken by the request that was turned away.
+    assert admission.live == webapp.MAX_CONCURRENT_SESSIONS
+
+
+def test_an_in_request_solve_fills_a_slot_the_session_route_can_see(
+    client: TestClient,
+    manager: FakeManager,
+    admission: webapp._SolveAdmission,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One notion of "how many solves are running", not two.
+
+    The counter lives in ``app.py`` because ``SessionManager`` has no way to
+    reserve a slot for work it does not own, but it is *added to*
+    ``manager.active`` rather than kept as a rival total -- so an in-request
+    solve is what stops the next session, and the two caps cannot disagree.
+    """
+    monkeypatch.setattr(webapp, "MAX_CONCURRENT_SESSIONS", 1)
+    admission.acquire()  # stands for a /api/solve/stream worker still solving
+    try:
+        assert admission.live == 1
+        response = client.post("/api/sessions", json={"puzzle": "mini-01"})
+        assert response.status_code == 429
+        assert manager.started == [], "the cap must refuse before the registry"
+        # And it is visible in the one place someone would look for it: the
+        # session count alone reported 0 while the budget was being spent.
+        health = client.get("/api/health").json()
+        assert health["active_sessions"] == 0
+        assert health["active_solves"] == 1
+    finally:
+        admission.release()
+    assert admission.live == 0
+
+
+def test_a_solve_that_raises_gives_its_slot_back(
+    client: TestClient,
+    manager: FakeManager,
+    admission: webapp._SolveAdmission,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A leaked slot would shrink the cap for the life of the process.
+
+    ``ForbiddenAgent`` supplies the failure -- the assertion it raises is the
+    autouse guard proving no paid solve happened -- and the point of the test is
+    what the ``finally`` did with the slot on the way out.
+    """
+    monkeypatch.setattr(cfg, "api_key", lambda: "test-key")
+    with pytest.raises(AssertionError, match="CrosswordAgent"):
+        client.post("/api/solve", json={"puzzle": "mini-01"})
+    assert admission.live == 0
+
+
+def test_the_stream_route_holds_its_slot_until_the_worker_is_done(
+    client: TestClient,
+    manager: FakeManager,
+    admission: webapp._SolveAdmission,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The slot belongs to the solve, not to the response.
+
+    ``/api/solve/stream`` has no cancel hook, so the worker keeps solving (and
+    billing) after the client hangs up. Releasing at disconnect would let one
+    caller hold the whole budget by opening streams and dropping them, so the
+    release lives in the worker's ``finally``.
+    """
+    monkeypatch.setattr(cfg, "api_key", lambda: "test-key")
+    body = client.post("/api/solve/stream", json={"puzzle": "mini-01"}).text
+    # The agent refused to be built, which the endpoint reports as data.
+    assert "CrosswordAgent" in body
+    deadline = time.monotonic() + 5.0
+    while admission.live and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert admission.live == 0, "the worker thread must hand its slot back"
+
+
 def test_create_session_is_503_without_an_api_key(
     client: TestClient, manager: FakeManager, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -786,27 +970,69 @@ def test_the_token_is_checked_before_the_api_key(
     assert client.post("/api/sessions", json={"puzzle": "mini-01"}).status_code == 401
 
 
-@pytest.mark.parametrize(
-    "path",
-    [
-        "/api/sessions",
-        "/api/sessions/s1",
-        "/api/sessions/s1/events",
-        "/api/sessions/s1/stream",
-        "/api/puzzles/mini-01",
-    ],
-)
-def test_reading_never_needs_the_access_token(
+@pytest.mark.parametrize("path", SESSION_READ_PATHS)
+def test_session_reads_require_the_access_token(
     client: TestClient,
     manager: FakeManager,
     monkeypatch: pytest.MonkeyPatch,
     path: str,
 ) -> None:
-    """The token guards spending, not information -- and EventSource cannot send
-    a header, so requiring it on the stream would push the secret into a URL."""
+    """A trace is not metadata.
+
+    It carries the verbatim system prompt and clue batches sent to Anthropic,
+    the model's answers, the cost, and -- for a puzzle submitted inline with a
+    solution -- the answers its owner supplied. With the reads open, an
+    anonymous visitor listed the ids and then replayed everything the token
+    holder paid for, which made the token a spend guard only in name.
+    """
+    monkeypatch.setattr(webapp, "ACCESS_TOKEN", "opensesame")
+    manager.add("s1", state="done", result={"gold": ["OAF"]})
+    manager.logs["s1"].close()  # so the stream terminates instead of tailing
+    response = client.get(path)
+    assert response.status_code == 401
+    assert "X-Access-Token" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("path", SESSION_READ_PATHS)
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"headers": {"X-Access-Token": "opensesame"}},
+        {"params": {"token": "opensesame"}},
+    ],
+)
+def test_session_reads_accept_the_token_in_a_header_or_the_query(
+    client: TestClient,
+    manager: FakeManager,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    kwargs: dict[str, Any],
+) -> None:
+    """Both ways, on every read route, and the query parameter is not optional.
+
+    ``EventSource`` cannot set a request header, so ``?token=`` is the only way
+    a browser can authenticate ``/stream`` at all; dropping it would make the
+    guarded stream unusable from the page it exists for.
+    """
     monkeypatch.setattr(webapp, "ACCESS_TOKEN", "opensesame")
     manager.add("s1", state="done")
-    manager.logs["s1"].close()  # so the stream terminates instead of tailing
+    manager.logs["s1"].close()
+    assert client.get(path, **kwargs).status_code == 200
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/api/health", "/api/puzzles", "/api/puzzles/mini-01", "/", "/static/studio.js"],
+)
+def test_the_token_does_not_lock_anyone_out_of_the_page_or_the_smoke_test(
+    client: TestClient,
+    manager: FakeManager,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+) -> None:
+    """Health is the smoke test, and the page has to load before it can ask for
+    a token -- so these stay open however the deployment is configured."""
+    monkeypatch.setattr(webapp, "ACCESS_TOKEN", "opensesame")
     assert client.get(path).status_code == 200
 
 
@@ -935,6 +1161,40 @@ def test_the_events_poll_reports_the_log_state_alongside_the_events(
     assert client.get("/api/sessions/s1/events").json()["closed"] is True
 
 
+def test_the_events_poll_never_reports_closed_over_events_it_did_not_send(
+    client: TestClient, manager: FakeManager
+) -> None:
+    """``closed: true`` must never arrive beside a slice that predates the end.
+
+    The client treats ``closed`` as end-of-stream: it stops polling and does not
+    re-attach. So a response pairing ``closed: true`` with an array taken before
+    ``result`` and the terminal ``status`` landed costs the session view its
+    grid, its score and its entries table for the life of the page.
+
+    :class:`_LateFinishSliceLog` finishes the solve inside the handler, between
+    the flag and the array. Sampling ``closed`` first makes that harmless -- the
+    poll reports the still-open log with what it had, and the next one carries
+    the rest -- and no interleaving can produce the optimistic pairing.
+    """
+    manager.add("s1", state="running")
+    log = _LateFinishSliceLog()
+    manager.logs["s1"] = log
+    log.append("status", {"state": "running", "message": "solving"})
+
+    first = client.get("/api/sessions/s1/events?cursor=0").json()
+    assert log.slices == 1, "the race window has to have been used"
+    assert [e["seq"] for e in first["events"]] == [1]
+    assert first["closed"] is False, "closed must not describe a later log"
+    # The invariant, stated as the client reads it: if the poll says the log is
+    # finished, nothing is left above the cursor it handed back.
+    assert not first["closed"] or log.since(first["cursor"]) == []
+
+    second = client.get(f"/api/sessions/s1/events?cursor={first['cursor']}").json()
+    assert [e["type"] for e in second["events"]] == ["result", "status"]
+    assert second["closed"] is True
+    assert log.since(second["cursor"]) == []
+
+
 def test_the_events_poll_404s_when_a_session_has_no_log(
     client: TestClient, manager: FakeManager
 ) -> None:
@@ -1017,6 +1277,56 @@ def test_the_stream_tails_a_live_log_and_ends_when_it_closes(
 
     assert [name for name, _ in frames] == ["status", "result", "closed"]
     assert frames[1][1]["payload"] == {"puzzle": {"id": "mini-01"}}
+
+
+def test_the_stream_drains_the_log_before_it_declares_the_stream_closed(
+    client: TestClient, manager: FakeManager
+) -> None:
+    """The events that land in the post-timeout gap must still be delivered.
+
+    The writer's order is ``result``, terminal ``status``, ``close()``, so the
+    gap between a timed-out wait and a read of ``closed`` swallows precisely the
+    two events a subscriber is waiting for -- and it is told the stream ended,
+    so the page never re-attaches to collect them.
+
+    :class:`_LateFinishLog` scripts that gap. What the subscriber must see is
+    every event, in order, with ``closed`` last and its cursor naming the final
+    sequence number rather than the one from before the gap.
+    """
+    manager.add("s1", state="running")
+    log = _LateFinishLog()
+    manager.logs["s1"] = log
+    log.append("status", {"state": "running", "message": "solving"})
+
+    frames = _frames(client.get("/api/sessions/s1/stream?cursor=0").text)
+
+    assert log.waits >= 1, "the race window has to have been used"
+    assert [name for name, _ in frames] == ["status", "result", "status", "closed"]
+    assert frames[1][1]["payload"] == {"puzzle": {"id": "mini-01"}}
+    assert frames[-1][1] == {"cursor": 3, "dropped": 0}
+
+
+def test_a_reattaching_subscriber_gets_the_tail_of_a_finished_log(
+    client: TestClient, manager: FakeManager
+) -> None:
+    """Replay is the same code path as tailing, and it has to end, not hang.
+
+    A client that read three events, went away, and comes back to a session
+    that has since finished asks for everything since 3. It gets the tail and
+    then the close, in one connection.
+    """
+    manager.add("s1", state="done")
+    log = manager.logs["s1"]
+    log.append("status", {"state": "running", "message": "solving"})
+    log.append("step", {"kind": "propose", "round": 1, "message": "", "data": {}})
+    log.append("step", {"kind": "commit", "round": 1, "message": "", "data": {}})
+    log.append("result", {"puzzle": {"id": "mini-01"}})
+    log.append("status", {"state": "done", "message": "finished"})
+    log.close()
+
+    frames = _frames(client.get("/api/sessions/s1/stream?cursor=3").text)
+    assert [name for name, _ in frames] == ["result", "status", "closed"]
+    assert frames[-1][1]["cursor"] == 5
 
 
 def test_the_sse_frame_helper_formats_one_event() -> None:

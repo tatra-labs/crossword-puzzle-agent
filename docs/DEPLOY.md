@@ -101,9 +101,14 @@ Two ways to close that, and you want at least one:
 
 - **Vercel Deployment Protection** (Settings → Deployment Protection) — the
   simplest: requires a Vercel login to reach the deployment at all.
-- **A shared secret.** Set `XWORD_ACCESS_TOKEN` and the solve endpoints require
-  it as an `X-Access-Token` header or `?token=` parameter; `/api/health` and the
-  page itself stay open. Unset, the app is open by design.
+- **A shared secret.** Set `XWORD_ACCESS_TOKEN` and every `/api/solve` and
+  `/api/sessions` route requires it as an `X-Access-Token` header or a `?token=`
+  parameter — the session **reads** included, because a trace carries the prompts
+  sent, the answers returned, the cost, and the solution of an inline puzzle.
+  `/api/health`, `/api/puzzles*` and the page and its assets stay open, since the
+  page has to load before it can send anything. Open the page as
+  `?token=<secret>`; it caches the secret and sends it on every request from
+  then on. Unset, the app is open by design.
 
 There is no per-IP rate limiting in this app. If you make it genuinely public,
 add Vercel's WAF rate limiting in front of `/api/solve*`.

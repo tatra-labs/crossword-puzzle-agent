@@ -60,7 +60,7 @@ import time
 import traceback
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from xword.config import AgentConfig, estimate_cost
@@ -200,6 +200,9 @@ class _Session:
     ``created_at`` cannot do that job: on Windows ``time.time()`` advances in
     ~16ms steps, so two sessions started in the same tick share a timestamp and
     would sort arbitrarily against each other.
+
+    ``transition`` serialises state changes; see
+    :meth:`SessionManager._transition_locked` for why one lock could not.
     """
 
     info: SessionInfo
@@ -207,6 +210,7 @@ class _Session:
     config: AgentConfig
     log: TraceLog
     cancel: threading.Event
+    transition: threading.Lock = field(default_factory=threading.Lock)
     seq: int = 0
     thread: threading.Thread | None = None
     result: dict[str, Any] | None = None
@@ -243,12 +247,19 @@ def _default_agent_factory(
 class SessionManager:
     """Owns the running solves and the logs they write to.
 
-    The locking rule, in one line: **the manager lock may be held while taking a
-    log's lock, never the reverse.** Readers (HTTP handlers) take the manager
-    lock to copy a snapshot; the solve thread takes it to bump progress and
-    releases it before appending to the log. Neither the agent nor the serialiser
-    is ever called with the lock held, so a session listing never waits on
-    belief propagation.
+    There are three locks and exactly one order they may be taken in:
+    **a session's ``transition`` lock, then the manager lock, then a log's
+    lock.** Nothing anywhere takes them in any other order, and nothing takes
+    the transition lock while already holding one of the other two, which is
+    what makes the order sufficient rather than merely conventional.
+
+    Who takes what: readers (HTTP handlers) take only the manager lock, to copy
+    a snapshot. The solve thread takes it to bump progress and releases it
+    before appending to the log. State changes -- and only state changes -- take
+    the transition lock as well, and hold it across both halves of the change:
+    :meth:`_transition_locked` explains why that second lock has to exist.
+    Neither the agent nor the serialiser is ever called with any lock held, so a
+    session listing never waits on belief propagation.
     """
 
     def __init__(
@@ -383,20 +394,36 @@ class SessionManager:
         stopping all return ``False``. The UI has to be able to tell "I just
         stopped it" from "there was nothing to stop", and a button that always
         reports success cannot.
+
+        The test-and-set runs under the session's transition lock rather than
+        under the manager lock alone, so that this stop is ordered against the
+        solve thread's own transitions instead of racing them: without that, a
+        stop and a finishing solve interleave into a ``stopping`` event appended
+        after the terminal one, and a stop that lands in the queued-to-running
+        window is silently overwritten by ``running``.
         """
         with self._lock:
             session = self._sessions.get(sid)
-            if session is None or session.info.state not in INTERRUPTIBLE_STATES:
-                return False
-            session.cancel.set()
-            message = (
+        if session is None:
+            return False
+
+        # The manager lock is released above and retaken inside; taking the
+        # transition lock while holding it would invert the module's one
+        # permitted lock order.
+        with session.transition:
+            with self._lock:
+                if session.info.state not in INTERRUPTIBLE_STATES:
+                    return False
+                # Flagged in the same critical section as the test, so two
+                # concurrent stops cannot both claim to be the one that
+                # changed something.
+                session.cancel.set()
+            return self._transition_locked(
+                session,
+                "stopping",
                 "stop requested; the agent hands back the grid it has at its next "
-                "cancellation check"
+                "cancellation check",
             )
-            session.info.state = "stopping"
-            session.info.message = message
-        session.log.append("status", {"state": "stopping", "message": message})
-        return True
 
     def delete(self, sid: str) -> bool:
         """Forget a finished session. Refuses a live one.
@@ -475,7 +502,7 @@ class SessionManager:
             self._sessions.pop(session.info.id, None)
             session.log.close()
 
-    def _transition(
+    def _transition_locked(
         self,
         session: _Session,
         state: SessionState,
@@ -483,16 +510,53 @@ class SessionManager:
         *,
         error: str = "",
         finished: bool = False,
-    ) -> None:
-        """Move a session's state and tell the log about it.
+    ) -> bool:
+        """Move a session's state and tell the log about it, as one step.
 
-        The snapshot is updated before the event is appended, because appending
-        wakes every subscriber and the first thing a woken subscriber does is read
-        ``info()``. The other order shows a client a "done" event beside a
-        session that still claims to be running.
+        The caller must already hold ``session.transition``; every state change
+        in this class does, which is why there is no unlocked variant to reach
+        for by mistake.
+
+        Why two locks, since the next reader of this file will want one
+        ---------------------------------------------------------------
+        The manager lock cannot do this job on its own. It is the lock every
+        HTTP reader takes to copy a snapshot, so holding it across
+        ``log.append`` would put a session listing behind a log write and break
+        the rule that a reader never waits on the writer -- and it would put a
+        second lock (the log's) inside the lock a reader holds, which is exactly
+        the shape a later deadlock grows out of. Releasing it between the state
+        change and the append -- which is what this used to do -- is worse: two
+        transitions then interleave freely, and a ``stop()`` racing a finishing
+        solve appends its ``stopping`` event *after* the terminal status and
+        after ``close()``, leaving a trace whose last event contradicts the
+        session and which no subscriber is required to have read.
+
+        So state transitions take a second, per-session lock that only they
+        take, and hold it across both halves and across the ``close()`` that
+        ends the log. The order is **transition -> manager -> log**, never any
+        other; ``stop()`` releases the manager lock before taking the transition
+        lock for that reason.
+
+        What this does and does not promise
+        -----------------------------------
+        Transitions are totally ordered and indivisible with respect to each
+        other, and no status event can follow the terminal one -- ``False`` is
+        returned, and nothing written, for a session that has already ended.
+        Subscribers are told to treat the terminal ``status`` as end-of-stream,
+        so an event appended after it is one they cannot be relied on to see.
+
+        It is *not* a claim that a reader sees the state change and the event at
+        the same instant: the snapshot is deliberately updated first, because
+        appending wakes every subscriber and the first thing a woken subscriber
+        does is read ``info()``. The other order shows a client a "done" event
+        beside a session that still claims to be running, which is the
+        inconsistency that persists; this one closes within microseconds and in
+        the safe direction.
         """
         with self._lock:
             info = session.info
+            if info.state in TERMINAL_STATES:
+                return False
             info.state = state
             info.message = message
             if error:
@@ -502,30 +566,15 @@ class SessionManager:
             if finished and not info.finished_at:
                 info.finished_at = time.time()
         session.log.append("status", {"state": state, "message": message})
+        return True
 
     # -- internals: the solve thread --------------------------------------- #
 
     def _run(self, session: _Session) -> None:
         """One session's whole life, on its own thread."""
         try:
-            if session.cancel.is_set():
-                # Stopped while still queued. Checking here, before the agent
-                # exists, is the difference between a cancelled session costing
-                # nothing and costing a whole puzzle.
-                self._transition(
-                    session,
-                    "stopped",
-                    "stopped before the first API call; nothing was spent",
-                    finished=True,
-                )
-                session.log.close()
+            if not self._begin(session):
                 return
-
-            self._transition(
-                session,
-                "running",
-                f"solving {session.info.puzzle_id} with {session.config.model}",
-            )
             agent = self._agent_factory(
                 session.config,
                 on_event=lambda event: self._on_step(session, event),
@@ -540,6 +589,40 @@ class SessionManager:
             self._succeed(session, payload)
         finally:
             self._ensure_terminal(session)
+
+    def _begin(self, session: _Session) -> bool:
+        """Take a queued session to ``running``, or straight to ``stopped``.
+
+        ``False`` means a stop had already landed and there is nothing to solve.
+
+        The cancel flag is read and the ``running`` transition made under one
+        hold of the transition lock, because the two are a check and an act on
+        the same piece of state. Read the flag, let a ``stop()`` run to
+        completion, then transition: the session goes stopping -> running, the
+        stop reads as ignored, and -- because ``running`` is interruptible again
+        -- the next click is accepted as a second stop and logs a duplicate
+        ``stopping`` event.
+        """
+        with session.transition:
+            if session.cancel.is_set():
+                # Stopped while still queued. Checking here, before the agent
+                # exists, is the difference between a cancelled session costing
+                # nothing and costing a whole puzzle.
+                self._transition_locked(
+                    session,
+                    "stopped",
+                    "stopped before the first API call; nothing was spent",
+                    finished=True,
+                )
+                session.log.close()
+                return False
+
+            self._transition_locked(
+                session,
+                "running",
+                f"solving {session.info.puzzle_id} with {session.config.model}",
+            )
+            return True
 
     def _on_step(self, session: _Session, event: AgentEvent) -> None:
         """Mirror one ``AgentEvent`` into the snapshot and then into the log."""
@@ -568,13 +651,28 @@ class SessionManager:
         from the call records, and :meth:`_succeed` replaces them with the
         authoritative per-puzzle stats.
 
-        A record with ``cached`` set was answered from the local clue cache: it
-        is logged, because it explains where an answer came from, but it is not
-        counted as a call and costs nothing.
+        The number means **billed calls**, not attempted ones, and two kinds of
+        record are therefore logged without being counted. A record with
+        ``cached`` set was answered from the local clue cache, so no request was
+        ever made. A record carrying an ``error`` is one whose request produced
+        nothing -- it gave up after its retries, or a stop landed before the
+        next one -- and ``LLMCandidateSource`` books that under ``usage.failures``
+        while ``usage.calls`` advances only after a ``messages.create`` that
+        actually returned.
+
+        Which is precisely why "billed" is the definition to pick:
+        ``SolveStats.llm_calls`` is a diff of ``usage.calls``, so counting
+        attempts here would read one higher per failed request all the way
+        through the solve and then be replaced by the lower authoritative figure
+        at the end. A counter that walks up and then drops does not read as an
+        estimate being corrected, it reads as a bug in the agent -- the exact
+        distrust this running total exists to avoid. Nothing is hidden by the
+        choice: the failed request is still in the trace with its error, and the
+        retries behind a call that did succeed are on its record as ``attempts``.
         """
         with self._lock:
             info = session.info
-            if not record.cached:
+            if not record.cached and not record.error:
                 info.llm_calls += 1
             info.input_tokens += (
                 record.input_tokens + record.cache_read_tokens + record.cache_write_tokens
@@ -598,28 +696,15 @@ class SessionManager:
         with ``finished_at`` set, then ``close()``. Closing first would release
         every waiting subscriber before the result had been appended, and each of
         them would conclude the session ended with nothing to show.
+
+        All of it runs under the transition lock, so a ``stop()`` cannot land in
+        the middle of the sequence. It either arrives before, and is read below
+        as the reason this solve ended ``stopped``, or it arrives after and finds
+        a terminal session to decline -- rather than appending a ``stopping``
+        event onto a log this method has already closed.
         """
         stats = payload.get("stats") if isinstance(payload, dict) else None
         score = payload.get("score") if isinstance(payload, dict) else None
-
-        with self._lock:
-            info = session.info
-            session.result = payload
-            if isinstance(stats, dict):
-                # Authoritative, and charged to this puzzle alone; they supersede
-                # the running estimate accumulated from the call records.
-                info.llm_calls = int(stats.get("llm_calls", info.llm_calls))
-                info.input_tokens = int(stats.get("input_tokens", info.input_tokens))
-                info.output_tokens = int(stats.get("output_tokens", info.output_tokens))
-                info.cost_usd = float(stats.get("cost_usd", info.cost_usd))
-            if isinstance(score, dict):
-                info.solved = bool(score.get("solved"))
-                info.cells_correct = int(score.get("cells_correct", 0))
-                info.cells_total = int(score.get("cells_total", 0))
-            # No ``score`` key means the puzzle shipped no answers, so ``solved``
-            # stays None rather than claiming a failure nobody graded.
-
-        session.log.append("result", payload)
 
         seconds = 0.0
         rounds = 0
@@ -629,24 +714,47 @@ class SessionManager:
             rounds = int(stats.get("rounds", 0) or 0)
             calls = int(stats.get("llm_calls", 0) or 0)
 
-        if session.cancel.is_set():
-            # The stop could have landed anywhere between the first cancellation
-            # check and the last, so the honest claim is that a stop was asked
-            # for and this is the grid the agent had -- not that the solve was
-            # cut short at any particular phase.
-            state: SessionState = "stopped"
-            message = (
-                f"stopped on request after {rounds} round(s); the result is the best "
-                f"grid the agent had reached, {calls} API call(s) in"
-            )
-        else:
-            state = "done"
-            message = (
-                f"done in {seconds:.1f}s, {rounds} round(s), {calls} API call(s)"
-            )
+        with session.transition:
+            with self._lock:
+                info = session.info
+                session.result = payload
+                if isinstance(stats, dict):
+                    # Authoritative, and charged to this puzzle alone; they
+                    # supersede the running estimate accumulated from the call
+                    # records -- which ``_on_llm_call`` counts on the same
+                    # definition, so this is a confirmation and not a jump.
+                    info.llm_calls = int(stats.get("llm_calls", info.llm_calls))
+                    info.input_tokens = int(stats.get("input_tokens", info.input_tokens))
+                    info.output_tokens = int(stats.get("output_tokens", info.output_tokens))
+                    info.cost_usd = float(stats.get("cost_usd", info.cost_usd))
+                if isinstance(score, dict):
+                    info.solved = bool(score.get("solved"))
+                    info.cells_correct = int(score.get("cells_correct", 0))
+                    info.cells_total = int(score.get("cells_total", 0))
+                # No ``score`` key means the puzzle shipped no answers, so
+                # ``solved`` stays None rather than claiming a failure nobody
+                # graded.
 
-        self._transition(session, state, message, finished=True)
-        session.log.close()
+            session.log.append("result", payload)
+
+            if session.cancel.is_set():
+                # The stop could have landed anywhere between the first
+                # cancellation check and the last, so the honest claim is that a
+                # stop was asked for and this is the grid the agent had -- not
+                # that the solve was cut short at any particular phase.
+                state: SessionState = "stopped"
+                message = (
+                    f"stopped on request after {rounds} round(s); the result is the best "
+                    f"grid the agent had reached, {calls} API call(s) in"
+                )
+            else:
+                state = "done"
+                message = (
+                    f"done in {seconds:.1f}s, {rounds} round(s), {calls} API call(s)"
+                )
+
+            self._transition_locked(session, state, message, finished=True)
+            session.log.close()
 
     def _fail(self, session: _Session, exc: Exception) -> None:
         """Turn a crashed solve into something the UI can show.
@@ -657,12 +765,17 @@ class SessionManager:
         the traceback goes into the ``error`` event's message, because a studio
         whose failure mode is "something went wrong" is no better than a blank
         screen. Either way it is never merely swallowed.
+
+        Under the transition lock for the same reason as :meth:`_succeed`: the
+        ``error`` event, the terminal status and the close are one step, and a
+        concurrent ``stop()`` goes either wholly before them or not at all.
         """
         summary = f"{type(exc).__name__}: {exc}"
         detail = traceback.format_exc()[-MAX_TRACEBACK_CHARS:]
-        session.log.append("error", {"message": f"{summary}\n\n{detail}"})
-        self._transition(session, "error", summary, error=summary, finished=True)
-        session.log.close()
+        with session.transition:
+            session.log.append("error", {"message": f"{summary}\n\n{detail}"})
+            self._transition_locked(session, "error", summary, error=summary, finished=True)
+            session.log.close()
 
     def _ensure_terminal(self, session: _Session) -> None:
         """Backstop for a thread that unwound without finishing its session.
@@ -672,18 +785,19 @@ class SessionManager:
         above. Left alone, such a session reads "running" for ever and its
         subscribers block on a log that never closes, so it is marked and closed
         here instead.
+
+        Routed through the transition lock like every other state change, so
+        that this backstop cannot itself be the thing that interleaves with a
+        ``stop()`` arriving at the same moment.
         """
-        with self._lock:
-            info = session.info
-            if info.state in TERMINAL_STATES:
-                return
-            info.state = "error"
-            info.error = info.error or "the solve thread exited without finishing"
-            info.message = info.error
-            info.finished_at = time.time()
-            message = info.message
-        session.log.append("status", {"state": "error", "message": message})
-        session.log.close()
+        with session.transition:
+            with self._lock:
+                info = session.info
+                if info.state in TERMINAL_STATES:
+                    return
+                summary = info.error or "the solve thread exited without finishing"
+            self._transition_locked(session, "error", summary, error=summary, finished=True)
+            session.log.close()
 
 
 __all__ = [

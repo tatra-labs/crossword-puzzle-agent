@@ -62,13 +62,22 @@ are looking at:
   candidate per entry taken from each model call's tool input, drawn dimmed. The
   trace stream carries numbers and strings, not per-cell beliefs, so nothing
   better is available mid-solve.
+- Those candidates go through the same cleaning the solver applies before it
+  believes them: the slot id is trimmed and upper-cased, everything outside A–Z
+  is stripped, and an answer whose length does not match the entry is not drawn
+  at all. The panel's claim is that it shows what the solve is doing, so a letter
+  the solver rejected has no business being on the grid.
 - Per-cell confidence shading, and right/wrong marking against the reference
   solution, appear only once the `result` event lands.
 
 **Right.** Steps render compactly (phase chip, round, message). Model calls
 render as cards: collapsed they show kind, model, duration, tokens, attempts and
 any error; expanded they show the prompt (system folded by default), the tool
-call with its input, and the result, each block with a copy button. A call served
+call with its input, and the result, each block with a copy button. A card
+reporting more than one attempt also names what each earlier attempt failed
+with — a retried call that then succeeded carries no `error`, so the attempt
+count on its own would report a slow call and not say what it was waiting on.
+A call served
 from the clue cache is drawn as "no API call" rather than as an empty request,
 because that is what it is. Filter by steps or model calls; auto-scroll follows
 the tail and switches itself off when you scroll up to read something.
@@ -95,7 +104,7 @@ the stream keeps failing. Either way the events are the same five types:
 |---|---|
 | `status` | The session's state and a message. The **terminal** `status` is end-of-stream, not `result`. |
 | `step` | One agent phase event: kind, round, message, and numeric data. |
-| `llm_call` | One model request: prompts, tools, tool call, tokens, duration, attempts, error. |
+| `llm_call` | One model request: prompts, tools, tool call, tokens, duration, attempts, `retry_errors`, error. |
 | `result` | The finished solve, the same shape `POST /api/solve` returns. |
 | `error` | The session died; the message carries the traceback tail. |
 
@@ -122,9 +131,12 @@ Sessions live in the server process, which means:
   state, which is a different design.
 - **A restart loses everything.** The registry is memory, not a database.
 
-`GET /api/health` reports `durable_sessions`, `max_concurrent_sessions` and
-`active_sessions`, and the page reads the first of those to decide which path to
-take. If it is missing, the page assumes false and uses the legacy path.
+`GET /api/health` reports `durable_sessions`, `max_concurrent_sessions`,
+`active_sessions` and `active_solves`, and the page reads the first of those to
+decide which path to take. If it is missing, the page assumes false and uses the
+legacy path. `active_sessions` counts registered sessions; `active_solves` counts
+those **plus** the in-request solves on `/api/solve` and `/api/solve/stream`,
+which spend the same money and used to be invisible here.
 
 ---
 
@@ -132,6 +144,16 @@ take. If it is missing, the page assumes false and uses the legacy path.
 
 Three solves at once, by default. Over that, `POST /api/sessions` answers **429**
 with a message naming the cap; it does not queue.
+
+The cap counts **every** solve the deployment pays for, not only sessions:
+`POST /api/solve` and `POST /api/solve/stream` admit against the same number and
+answer the same 429. One counter, two enforcement points — a per-request solve
+fills a slot the session route can see, and a running session refuses a legacy
+solve. Otherwise the older endpoints were a way around the cap, and a worse one
+than the session route: neither has a cancel hook, so an abandoned request keeps
+solving and billing until the wall-clock budget expires, which is why the stream
+route holds its slot until the worker actually finishes rather than until the
+client hangs up.
 
 ```bash
 XWORD_MAX_CONCURRENT_SESSIONS=1 python -m uvicorn app:app --port 8000
@@ -144,10 +166,32 @@ twenty clicks, with no way to un-spend it. Refusing the fourth click before any
 money moves is the useful failure. It is the same reasoning as the `413` on
 oversized puzzles: refused up front rather than started and abandoned part-way.
 
+---
+
+## Access control
+
 If you want the page reachable by other people, set `XWORD_ACCESS_TOKEN`. It
-guards the three mutating routes — create, stop, delete — as an `X-Access-Token`
-header or `?token=`, and leaves the read routes open, since those spend nothing.
-There is no per-IP rate limiting in this app.
+guards every `/api/sessions` and `/api/solve` route — **the reads as well as the
+writes** — as an `X-Access-Token` header or a `?token=` query parameter. Reading
+was open on the reasoning that reads spend nothing, which is true and beside the
+point: a trace is the token holder's data. It carries the verbatim system prompt
+and clue batches sent to Anthropic, the model's answers, the cost, and — for an
+inline puzzle — the solution the owner submitted, all reachable from an
+unguessable-but-listed session id. Left open are `/api/health` (the smoke test),
+`/api/puzzles*` (no answers in them) and the page and its two assets, because the
+page has to load before it can send a credential.
+
+Both mechanisms are accepted on every guarded route, and neither is redundant:
+`fetch` should not have to put a secret in a URL, and `EventSource` cannot set a
+request header, so `?token=` is the only way a browser can authenticate
+`/api/sessions/{sid}/stream` at all.
+
+The page has no token field. It takes the secret from its own URL — open
+`http://host:8000/?token=<secret>` — and caches it in `localStorage`, so later
+reloads of the bare URL still work on that browser. It then sends it as the
+header on every `fetch` and as `&token=` on the event stream. The footer says
+which of the two situations you are in. There is no per-IP rate limiting in this
+app.
 
 ---
 

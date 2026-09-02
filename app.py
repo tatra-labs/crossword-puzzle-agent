@@ -319,6 +319,87 @@ def _serialise(puzzle: Puzzle, result: Any) -> dict[str, Any]:
 manager = SessionManager(serialise=_serialise, max_concurrent=MAX_CONCURRENT_SESSIONS)
 
 
+def _cap_detail(live: int) -> str:
+    """The 429 body for a refused solve, worded like the manager's own sentence.
+
+    One condition should read one way wherever it is hit, and this one is hit
+    from three routes. It also has to say that the cap counts *both* kinds of
+    solve, because the obvious reading of "3 sessions at once" is that the
+    older endpoint is a way around it -- which is exactly the hole this closes.
+    """
+    return (
+        f"{live} solve(s) are already running and this deployment allows "
+        f"{MAX_CONCURRENT_SESSIONS} at once. The cap is a spend guard rather than a "
+        f"performance one: every concurrent solve is issuing real Anthropic requests "
+        f"-- about $0.007 for a 5x5 and $0.65 for a 15x15 -- and it counts background "
+        f"sessions and in-request solves together, so POST /api/solve and "
+        f"POST /api/solve/stream are not a way around it. Wait for one to finish, or "
+        f"stop a running session, and try again."
+    )
+
+
+class _SolveAdmission:
+    """Counted admission for the solves that no session registry can see.
+
+    ``SessionManager`` enforces ``max_concurrent`` over its own registry, which
+    is where it belongs: a session is a thread the manager owns. But
+    ``/api/solve`` and ``/api/solve/stream`` start identical, identically priced
+    work without registering anything, so the manager's count is blind to them
+    and twenty parallel 15x15s through the older endpoint spend twenty times
+    $0.65 while the fourth session is being refused for the same reason.
+
+    This is the missing half, and it is deliberately *added to*
+    ``manager.active`` rather than kept as a rival total: every route admits
+    against one number, so the two caps cannot drift apart. The manager stays
+    the authority on how many sessions are live -- this object only knows about
+    the in-request solves, which nothing else does.
+
+    Lock discipline is the manager's, extended by one level: this lock may be
+    held while taking the manager's (inside ``manager.active``), never the
+    reverse, and it is never held across a solve -- only across the arithmetic.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._running = 0
+
+    @property
+    def live(self) -> int:
+        """Paid work in flight: registered sessions plus in-request solves."""
+        with self._lock:
+            return manager.active + self._running
+
+    def check(self) -> None:
+        """Refuse a *session* the combined cap has no room for.
+
+        ``SessionManager.start`` re-applies the cap over its registry under its
+        own lock, so this adds only what the registry cannot see. Without it a
+        caller could spend the session cap's budget through the legacy routes
+        and still be told there was room for another session.
+        """
+        with self._lock:
+            self._refuse_if_full_locked()
+
+    def acquire(self) -> None:
+        """Admit one in-request solve, or raise 429. Release it in a ``finally``."""
+        with self._lock:
+            self._refuse_if_full_locked()
+            self._running += 1
+
+    def release(self) -> None:
+        with self._lock:
+            self._running = max(0, self._running - 1)
+
+    def _refuse_if_full_locked(self) -> None:
+        live = manager.active + self._running
+        if live >= MAX_CONCURRENT_SESSIONS:
+            raise HTTPException(429, _cap_detail(live))
+
+
+#: One admission gate per process, like the registry it counts alongside.
+_admission = _SolveAdmission()
+
+
 #: Optional shared secret. A deployment of this app is a public URL that spends
 #: real money from your Anthropic key on every click, so if this is set the
 #: solve endpoints require it (header ``X-Access-Token`` or ``?token=``). Left
@@ -378,6 +459,11 @@ def health() -> JSONResponse:
             "durable_sessions": DURABLE_SESSIONS,
             "max_concurrent_sessions": MAX_CONCURRENT_SESSIONS,
             "active_sessions": manager.active,
+            # Sessions plus the in-request solves the registry never sees.
+            # `active_sessions` alone reported 0 while /api/solve/stream burned
+            # the deployment's whole budget, which made the bypass invisible in
+            # the one place someone would look for it.
+            "active_solves": _admission.live,
             "python": sys.version.split()[0],
         }
     )
@@ -483,15 +569,26 @@ def solve(
     x_access_token: str | None = Header(default=None),
     token: str | None = None,
 ) -> JSONResponse:
-    """Solve and return the finished grid. Blocking; use /api/solve/stream for progress."""
+    """Solve and return the finished grid. Blocking; use /api/solve/stream for progress.
+
+    Subject to the same concurrency cap as a session, and for the same reason:
+    the money is spent by the solve, not by the route that started it.
+    """
     _require_access(x_access_token or token)
     _require_key()
     puzzle = _load_request(body)
     from xword.solver.agent import CrosswordAgent
 
     events: list[AgentEvent] = []
-    agent = CrosswordAgent(_agent_config(body), on_event=events.append)
-    result = agent.solve(puzzle)
+    # Admitted after the size guard, so a puzzle that is refused anyway never
+    # occupies a slot, and released in a finally so a solve that raises does
+    # not leak one and shrink the cap for the life of the process.
+    _admission.acquire()
+    try:
+        agent = CrosswordAgent(_agent_config(body), on_event=events.append)
+        result = agent.solve(puzzle)
+    finally:
+        _admission.release()
     return JSONResponse(_serialise(puzzle, result))
 
 
@@ -508,6 +605,12 @@ async def solve_stream(
     issues its API batches through a thread pool; awaiting it directly would
     block the event loop and starve the very heartbeats this endpoint exists to
     send.
+
+    That thread is also why the concurrency slot is released by the worker and
+    not by this handler: the solve has no cancel hook, so it runs to completion
+    even after the client hangs up, and a slot handed back at disconnect would
+    let one caller hold the deployment's entire spend budget by opening streams
+    and dropping them.
     """
     _require_access(x_access_token or token)
     _require_key()
@@ -530,9 +633,15 @@ async def solve_stream(
             channel.put(("error", {"message": f"{type(exc).__name__}: {exc}"}))
         finally:
             channel.put(("done", None))
+            _admission.release()
 
+    _admission.acquire()
     worker = threading.Thread(target=run, daemon=True)
-    worker.start()
+    try:
+        worker.start()
+    except RuntimeError:  # the OS refused a thread; do not leak the slot
+        _admission.release()
+        raise
 
     async def stream() -> Iterator[str]:
         started = time.monotonic()
@@ -575,9 +684,16 @@ def _sse(event: str, data: Any) -> str:
 # The same solve as /api/solve, except the work is owned by the process instead
 # of by one response. Starting is a POST that returns immediately; watching is
 # a separate, resumable subscription; and stopping is a third request that may
-# come from a page which has since navigated elsewhere. Reading a session needs
-# no access token -- only starting, stopping and deleting do, matching
-# /api/solve, where the token guards spending rather than information.
+# come from a page which has since navigated elsewhere.
+#
+# Every session route requires the access token when one is configured --
+# reading included. A trace is not metadata: it carries the verbatim system
+# prompt and clue batches sent to Anthropic, the model's answers, the cost, and
+# for an inline puzzle the solution its submitter supplied. Leaving the reads
+# open let an anonymous visitor list the ids and then replay everything the
+# token holder paid for. /api/health, / and the two static files stay open,
+# because the smoke test has to work and the page has to load before anyone
+# can be asked for a token.
 # --------------------------------------------------------------------------- #
 
 
@@ -622,6 +738,11 @@ def create_session(
         )
     _require_key()
     puzzle = _load_request(body)
+    # The manager re-applies the cap over its own registry under its own lock;
+    # this adds the in-request solves the registry cannot see, so a caller
+    # cannot spend the session budget through /api/solve and still be told
+    # there is room here.
+    _admission.check()
     try:
         info = manager.start(puzzle, _agent_config(body))
     except SessionLimit as exc:
@@ -630,8 +751,16 @@ def create_session(
 
 
 @app.get("/api/sessions")
-def list_sessions() -> JSONResponse:
-    """Every session this process knows about, newest first."""
+def list_sessions(
+    x_access_token: str | None = Header(default=None),
+    token: str | None = None,
+) -> JSONResponse:
+    """Every session this process knows about, newest first.
+
+    Token-guarded like the rest: this listing is where an id comes from, and an
+    id is all the other reads need.
+    """
+    _require_access(x_access_token or token)
     return JSONResponse(
         {
             "sessions": [i.as_dict() for i in manager.list()],
@@ -642,49 +771,85 @@ def list_sessions() -> JSONResponse:
 
 
 @app.get("/api/sessions/{sid}")
-def session(sid: str) -> JSONResponse:
+def session(
+    sid: str,
+    x_access_token: str | None = Header(default=None),
+    token: str | None = None,
+) -> JSONResponse:
     """One session, plus its finished grid once there is one.
 
     ``result`` is null until the solve completes, which is what lets the UI use
     a single request to restore the whole right-hand pane -- header, progress
-    and grid -- when a puzzle is reopened.
+    and grid -- when a puzzle is reopened. That grid includes the gold answers
+    for a puzzle submitted with a solution, which is one of the reasons the
+    token is required here.
     """
+    _require_access(x_access_token or token)
     info = _session_or_404(sid)
     return JSONResponse({"session": info.as_dict(), "result": manager.result(sid)})
 
 
 @app.get("/api/sessions/{sid}/events")
-def session_events(sid: str, cursor: int = 0) -> JSONResponse:
+def session_events(
+    sid: str,
+    cursor: int = 0,
+    x_access_token: str | None = Header(default=None),
+    token: str | None = None,
+) -> JSONResponse:
     """Poll fallback for clients that cannot hold an SSE stream open.
 
     Non-blocking by design: a long-poll would tie up a worker for as long as a
     round takes, and it buys nothing here, because the cursor already
     guarantees that a client polling every few seconds misses no events.
     """
+    _require_access(x_access_token or token)
     info = _session_or_404(sid)
     log = manager.log(sid)
     if log is None:
         raise HTTPException(404, f"Session {sid!r} has no trace log.")
     at = max(0, cursor)
+    # `closed` and `dropped` are sampled *before* the slice, and this order is
+    # load-bearing: the writer appends `result`, then the terminal `status`,
+    # then closes, so reading the flag afterwards can pair `closed: true` with
+    # an events array captured before either landed -- and a client that trusts
+    # `closed` stops polling with the two events it most wanted still on the
+    # server. Sampling first can only err the harmless way round: a log that
+    # closes mid-handler reports `closed: false` with the events, and the next
+    # poll reports the close with nothing left to carry. Same hazard, same fix
+    # and same ordering as the `closed` read in /stream below.
+    #
+    # `dropped` is sampled on the other side of the slice for the identical
+    # reason: a drop evicts the oldest retained events, so a count taken before
+    # the slice can miss an eviction that the slice already suffered and tell a
+    # client its cursor gap is complete when it is not. The rule is one rule --
+    # sample each terminal fact on the side where being wrong is the
+    # conservative kind of wrong -- and for `closed` that is before, for
+    # `dropped` after.
+    closed = log.closed
     events = log.since(at)
-    # Read the session state *after* the events. The other order can report
-    # "running" alongside the result event, and a client that trusts `state`
-    # over `closed` would then stop polling one beat too early.
+    dropped = log.dropped
+    # The session state is read *after* the events for the mirror-image reason:
+    # the other order can report "running" alongside the result event, and a
+    # client that trusts `state` over `closed` would stop one beat too early.
     info = manager.info(sid) or info
     return JSONResponse(
         {
             "events": [e.as_dict() for e in events],
             "cursor": events[-1].seq if events else at,
             "session": info.as_dict(),
-            "closed": log.closed,
-            "dropped": log.dropped,
+            "closed": closed,
+            "dropped": dropped,
         }
     )
 
 
 @app.get("/api/sessions/{sid}/stream")
 async def session_stream(
-    sid: str, request: Request, cursor: int = 0
+    sid: str,
+    request: Request,
+    cursor: int = 0,
+    x_access_token: str | None = Header(default=None),
+    token: str | None = None,
 ) -> StreamingResponse:
     """Replay the trace from ``cursor``, then tail it live until the log closes.
 
@@ -692,7 +857,7 @@ async def session_stream(
     for everything since 40 and gets the gap followed by the tail, through the
     same loop a client joining at 0 runs.
 
-    Two details this has to get right:
+    Three details this has to get right:
 
     * ``TraceLog.wait_since`` blocks its thread. Called inline it would park
       the event loop for up to a second at a time, stalling every other
@@ -700,7 +865,12 @@ async def session_stream(
     * A subscriber who closes the tab leaves an async generator waiting on a
       log that may never close. Checking ``request.is_disconnected()`` each
       turn is what stops that becoming a thread leak per abandoned tab.
+    * The token, when the deployment has one, arrives either as the
+      ``X-Access-Token`` header or as ``?token=``. The query parameter is not
+      redundant here: ``EventSource`` cannot set a request header, so it is the
+      only way a browser can authenticate this route at all.
     """
+    _require_access(x_access_token or token)
     log = manager.log(sid)
     if log is None:
         raise HTTPException(
@@ -716,19 +886,46 @@ async def session_stream(
         while True:
             if await request.is_disconnected():
                 return
+            # `closed` is sampled BEFORE the wait, and that order is the whole
+            # correctness argument of this loop -- the obvious tidy-up, reading
+            # it in the `if` below, is the bug it replaced.
+            #
+            # wait_since returns nothing both on timeout and on a drained
+            # closed log, so a flag is the only way to tell those apart. Read
+            # after the wait, the flag reports a fact learned later than the
+            # last look at the events, and the gap between the two swallows
+            # whatever was appended in it. That gap is not a rare one: the
+            # writer appends `result`, then the terminal `status`, then closes,
+            # so the events lost are exactly the two the subscriber is waiting
+            # for, and the client -- told the stream is over -- never
+            # reattaches to collect them.
+            #
+            # Sampled first, the flag can only be stale in the safe direction:
+            # a log that closes during the wait looks live for one more turn,
+            # and that turn drains it and then declares the close. So there is
+            # no interleaving in which this generator says `closed` while the
+            # log still holds an event above `at`.
+            was_closed = log.closed
             pending = await asyncio.to_thread(log.wait_since, at, 1.0)
             for event in pending:
                 at = event.seq
                 yield _sse(event.type, event.as_dict())
-            if pending:
+            if not was_closed:
+                if not pending:
+                    # Idle: proxies (and Vercel) close a stream that says
+                    # nothing.
+                    yield ": keepalive\n\n"
                 continue
-            # wait_since returns nothing both on timeout and on a drained
-            # closed log; `closed` is the only thing that tells them apart.
-            if log.closed:
-                yield _sse("closed", {"cursor": at, "dropped": log.dropped})
-                return
-            # Idle: proxies (and Vercel) close a stream that says nothing.
-            yield ": keepalive\n\n"
+            # The log was already closed when this turn began, so wait_since
+            # returned everything above the cursor. Drain once more regardless:
+            # TraceLog.append has no closed guard, so a late writer is possible,
+            # and re-draining costs one uncontended lock while getting it wrong
+            # costs the subscriber the end of its trace.
+            for event in log.since(at):
+                at = event.seq
+                yield _sse(event.type, event.as_dict())
+            yield _sse("closed", {"cursor": at, "dropped": log.dropped})
+            return
 
     return StreamingResponse(
         stream(),

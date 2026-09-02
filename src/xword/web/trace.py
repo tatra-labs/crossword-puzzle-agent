@@ -126,6 +126,19 @@ class LLMCallRecord:
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
     attempts: int = 1
+    retry_errors: tuple[str, ...] = ()
+    """Why each earlier attempt failed, oldest first, when ``attempts > 1``.
+
+    Separate from ``error`` because the two answer different questions.
+    ``error`` is the outcome: non-empty only when the call produced nothing, and
+    what the UI keys its error chip off. ``retry_errors`` is the history, and a
+    call that failed twice and then succeeded has a history without having an
+    outcome -- ``attempts=3`` alone says a request took three tries but not what
+    was wrong with the first two, which is the whole of what a reader wants
+    when a solve is slow rather than broken. Folding them into ``error`` would
+    have painted every retried-but-successful call as a failure.
+    """
+
     cached: bool = False
     """True when the answer came from the local clue cache and no call was made."""
 
@@ -155,6 +168,7 @@ class LLMCallRecord:
             "cache_read_tokens": self.cache_read_tokens,
             "cache_write_tokens": self.cache_write_tokens,
             "attempts": self.attempts,
+            "retry_errors": list(self.retry_errors),
             "cached": self.cached,
             "error": self.error,
             "truncated": self.truncated,
@@ -174,6 +188,7 @@ class LLMCallRecord:
         tools: Iterable[str] = (),
         tool_choice: str = "",
         clue_ids: Iterable[str] = (),
+        retry_errors: Iterable[str] = (),
         **rest: Any,
     ) -> LLMCallRecord:
         """Construct with the text fields clipped and truncation flagged."""
@@ -191,6 +206,7 @@ class LLMCallRecord:
             tools=tuple(tools),
             tool_choice=tool_choice,
             clue_ids=tuple(clue_ids),
+            retry_errors=tuple(retry_errors),
             text=body,
             truncated=cut_a or cut_b or cut_c,
             **rest,

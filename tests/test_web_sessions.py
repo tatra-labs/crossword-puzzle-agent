@@ -32,6 +32,7 @@ assuming the answer.
 
 from __future__ import annotations
 
+import itertools
 import json
 import threading
 import time
@@ -641,6 +642,7 @@ class _ScriptedAgent:
         cancel: Callable[[], bool],
         on_llm_call: Callable[[LLMCallRecord], None],
         park_until_cancelled: bool = False,
+        hold_before_return: threading.Event | None = None,
         fail_with: BaseException | None = None,
         records: Sequence[LLMCallRecord] | None = None,
         stats: SolveStats | None = None,
@@ -650,6 +652,7 @@ class _ScriptedAgent:
         self._cancel = cancel
         self._on_llm_call = on_llm_call
         self._park = park_until_cancelled
+        self._hold = hold_before_return
         self._fail_with = fail_with
         self._records = records
         self._stats = stats
@@ -657,6 +660,10 @@ class _ScriptedAgent:
         #: Set once ``solve`` has emitted its opening events, so a test can wait
         #: for "the agent really is solving" instead of guessing at a sleep.
         self.working = threading.Event()
+        #: Set once the agent has reached ``hold_before_return`` -- the solve
+        #: finished but not yet published, which is the only vantage point from
+        #: which the registry's finalisers can be made to race anything.
+        self.holding = threading.Event()
         #: What the cancel predicate the registry handed over said, read after
         #: the parking loop. Proves the wiring, not merely the state change.
         self.cancel_seen = False
@@ -689,6 +696,13 @@ class _ScriptedAgent:
             raise self._fail_with
 
         self._on_event(AgentEvent(kind="done", round=1, message="done", data={}))
+
+        if self._hold is not None:
+            # Bounded like the parking loop, and for the same reason: a test
+            # that forgot to release this should fail, not hang the suite.
+            self.holding.set()
+            if not self._hold.wait(WAIT):
+                raise TimeoutError("the test never released the held agent")
         return self._result(puzzle, partial=self.cancel_seen)
 
     def _result(self, puzzle: Puzzle, *, partial: bool) -> SolveResult:
@@ -823,6 +837,27 @@ def _solving(factory: _ScriptedFactory, count: int = 1) -> None:
 
 def _statuses(log: TraceLog) -> list[str]:
     return [str(e.payload["state"]) for e in log.since(0) if e.type == "status"]
+
+
+def _transition_lock(manager: SessionManager, sid: str) -> threading.Lock:
+    """The lock a session's state changes are made under.
+
+    Reached through the registry's private dict, which is the only reach into
+    private state anywhere in this file and wants justifying. The property under
+    test is a locking property -- a state change and its ``status`` event are one
+    step -- and from outside the code that takes a lock, the only way to observe
+    it is to hold it: with this held, a ``stop()`` on another thread must have
+    written *neither* half. Polling for a moment when the snapshot and the log
+    disagree would prove nothing either way, because the window was always
+    narrow; what changed is that it is now closed.
+
+    It doubles as a starting gate. Taking it before releasing a held agent parks
+    the registry's finaliser on it, so a stop can be lined up behind that and the
+    two contend at a known point -- rather than the test issuing a stop into a
+    solve that has already finished and calling whatever came out a race.
+    """
+    with manager._lock:
+        return manager._sessions[sid].transition
 
 
 # =========================================================================== #
@@ -983,6 +1018,60 @@ def test_progress_and_money_track_the_call_records_while_running(
     _finished(manager, info.id)
 
 
+def test_a_failed_request_is_logged_without_being_billed(
+    mini_puzzle: Puzzle, make_manager: ManagerFactory
+) -> None:
+    """``llm_calls`` counts billed calls, so two kinds of record do not count.
+
+    A cache hit was never a request. A record carrying an ``error`` was a request
+    that produced nothing -- it exhausted its retries, or a stop landed before
+    the next one -- and the source books it under ``failures``, never under
+    ``calls``. Counting attempts instead would make the running figure one
+    higher per failure and then let it *drop* onto the authoritative
+    ``SolveStats``, which reads as the agent losing a call rather than as an
+    estimate being confirmed.
+    """
+    records = (
+        _record(input_tokens=2_000, output_tokens=300),
+        _record(
+            id="call-2",
+            error="ConnectionError: FakeClient: simulated transient failure",
+            input_tokens=0,
+            output_tokens=0,
+        ),
+        _cache_record(),
+    )
+    # The stats a real solve would report for exactly these records: one billed
+    # call, and the tokens only that call carried.
+    stats = SolveStats(
+        rounds=1, llm_calls=1, input_tokens=2_000, output_tokens=300, wall_seconds=0.02
+    )
+    factory = _ScriptedFactory(park_until_cancelled=True, records=records, stats=stats)
+    manager = make_manager(factory)
+    info = manager.start(mini_puzzle, AgentConfig())
+    _solving(factory)
+
+    running = manager.info(info.id)
+    assert running is not None
+    assert running.state == "running"
+    assert running.llm_calls == 1, "a request that came back with nothing was billed"
+    assert (running.input_tokens, running.output_tokens) == (2_000, 300)
+
+    # All three are still in the trace: the counter is about billing, not about
+    # what the reader is allowed to see.
+    log = manager.log(info.id)
+    assert log is not None
+    calls = [e.payload for e in log.since(0) if e.type == "llm_call"]
+    assert len(calls) == 3
+    assert [bool(c["error"]) for c in calls] == [False, True, False]
+
+    # And the scripted stats agree on the same definition, so nothing moves.
+    assert manager.stop(info.id) is True
+    final = _finished(manager, info.id)
+    assert final.llm_calls == running.llm_calls
+    assert (final.input_tokens, final.output_tokens) == (2_000, 300)
+
+
 def test_solved_stays_none_when_the_puzzle_shipped_no_answers(
     unsolved_puzzle: Puzzle, make_manager: ManagerFactory
 ) -> None:
@@ -1129,6 +1218,123 @@ def test_a_second_stop_and_a_stop_after_the_end_report_nothing_changed(
 
     _finished(manager, info.id)
     assert manager.stop(info.id) is False
+
+
+def test_a_stop_writes_both_halves_of_its_change_or_neither(
+    mini_puzzle: Puzzle, make_manager: ManagerFactory
+) -> None:
+    """A stop is one step: the new state and its ``status`` event, together.
+
+    It used to be two. ``stop()`` took the manager lock, wrote ``stopping``,
+    dropped the lock and only then appended the event, which left a real gap
+    another transition could be made in -- and the solve thread's own finalisers
+    made one. Held here from the outside, so that "indivisible" is asserted
+    rather than assumed: while the transition lock is held, the stop must have
+    moved neither the snapshot nor the log, and once released it must have moved
+    both.
+    """
+    factory = _ScriptedFactory(park_until_cancelled=True)
+    manager = make_manager(factory)
+    info = manager.start(mini_puzzle, AgentConfig())
+    _solving(factory)
+
+    log = manager.log(info.id)
+    assert log is not None
+    before = log.cursor
+    outcome: list[bool] = []
+    stopper = threading.Thread(
+        target=lambda: outcome.append(manager.stop(info.id)),
+        name="stopper",
+        daemon=True,
+    )
+
+    with _transition_lock(manager, info.id):
+        stopper.start()
+        stopper.join(TICK * 4)
+        assert stopper.is_alive(), "stop() completed in the middle of a transition"
+        during = manager.info(info.id)
+        assert during is not None
+        # Neither half. A state of "stopping" here would be the old bug: the
+        # snapshot changed, and a reader taking it has no event to match it to.
+        assert during.state == "running", "the state moved without its event"
+        assert log.cursor == before, "the event landed without the state"
+        assert outcome == []
+
+    stopper.join(WAIT)
+    assert not stopper.is_alive(), "stop() never returned"
+    assert outcome == [True]
+
+    after = manager.info(info.id)
+    assert after is not None
+    assert after.state in {"stopping", "stopped"}
+    assert _statuses(log)[:3] == ["queued", "running", "stopping"]
+
+    assert _finished(manager, info.id).state == "stopped"
+    assert _statuses(log) == ["queued", "running", "stopping", "stopped"]
+
+
+def test_a_stop_behind_a_finaliser_is_refused_not_logged_late(
+    mini_puzzle: Puzzle, make_manager: ManagerFactory
+) -> None:
+    """The review's interleaving A, arranged rather than waited for.
+
+    The agent is held with its solve complete but unpublished, and the
+    transition lock is taken *before* it is released, so the registry's
+    finaliser parks on that lock before it can publish anything. A stop is then
+    queued behind it. Releasing the lock lets the finaliser through first, and
+    the stop wakes to find a session that has already ended: it has to be
+    refused, leaving the terminal ``status`` the last event on a closed log.
+    What the old code could produce instead was a ``stopping`` event appended
+    *after* that terminal status and onto the closed log -- a trace whose last
+    event contradicts the session and which no subscriber is obliged to have
+    read, since it was told the stream ended one event earlier.
+
+    Lock hand-off order is not a language guarantee, so the other resolution --
+    the stop getting in first and the solve ending ``stopped`` -- is legitimate
+    and asserted too. Both branches say the same thing: the stop's return value
+    and the trace agree.
+    """
+    release = threading.Event()
+    factory = _ScriptedFactory(hold_before_return=release)
+    manager = make_manager(factory)
+    info = manager.start(mini_puzzle, AgentConfig())
+    _solving(factory)
+    _wait_for("the agent to reach its hold", factory.agents[0].holding.is_set)
+
+    outcome: list[bool] = []
+    stopper = threading.Thread(
+        target=lambda: outcome.append(manager.stop(info.id)),
+        name="stopper",
+        daemon=True,
+    )
+    with _transition_lock(manager, info.id):
+        release.set()  # the finaliser now queues on the lock this test holds
+        time.sleep(TICK)  # ... and is waiting on it before the stop asks
+        stopper.start()
+        time.sleep(TICK)
+
+    stopper.join(WAIT)
+    assert not stopper.is_alive(), "stop() never returned"
+    final = _finished(manager, info.id)
+
+    log = manager.log(info.id)
+    assert log is not None
+    events = log.since(0)
+    statuses = _statuses(log)
+
+    assert log.closed
+    assert events[-1].type == "status", f"the log ended on a {events[-1].type} event"
+    assert events[-1].payload["state"] == final.state
+    assert [s for s in statuses if s in TERMINAL_STATES] == [final.state]
+
+    # The stop either got in ahead of the finaliser or was refused outright. It
+    # may not report success without an event, nor leave one behind after the end.
+    assert statuses.count("stopping") == (1 if outcome == [True] else 0)
+    if outcome == [True]:
+        assert statuses == ["queued", "running", "stopping", "stopped"]
+    else:
+        assert outcome == [False]
+        assert statuses == ["queued", "running", "done"]
 
 
 def test_stop_on_a_finished_session_returns_false(
@@ -1369,10 +1575,16 @@ class _FakeClientFactory:
     keeps the clue cache out of the test: ``_build_llm`` is the only thing that
     opens one. ``on_call`` has to be passed here for the same reason -- the
     agent only forwards its observer to sources it builds itself.
+
+    ``max_retries`` is a constructor argument because ``AgentConfig`` has no
+    field for it: the source's default of four means a ``FakeClient`` set to
+    fail would back off for seconds and then succeed, and a test about what a
+    *failed* request does to the accounting needs it to give up at once.
     """
 
-    def __init__(self, client: FakeClient) -> None:
+    def __init__(self, client: FakeClient, *, max_retries: int = 4) -> None:
         self.client = client
+        self.max_retries = max_retries
         self.sources: list[LLMCandidateSource] = []
 
     def __call__(
@@ -1388,6 +1600,7 @@ class _FakeClientFactory:
             k=config.candidates_per_clue,
             batch_size=config.batch_size,
             max_concurrency=config.max_concurrency,
+            max_retries=self.max_retries,
             cache=None,
             client=self.client,
             on_call=on_llm_call,
@@ -1395,6 +1608,44 @@ class _FakeClientFactory:
         )
         self.sources.append(source)
         return CrosswordAgent(config, llm=source, on_event=on_event, cancel=cancel)
+
+
+class _WatchedFactory(_FakeClientFactory):
+    """Reads the sidebar's own numbers immediately after every call record.
+
+    A polling thread would sample whatever the scheduler allowed, and a solve
+    over a fake client is over in milliseconds -- so a monotonicity assertion
+    built on one would usually be asserting nothing. ``info.llm_calls`` and its
+    neighbours can only move inside ``_on_llm_call`` and once more in
+    ``_succeed``, so a reading taken straight after each record has been
+    accounted for is a reading at every point where a drop could appear.
+
+    The snapshot is fetched via ``list()`` rather than by id, because the first
+    record can be emitted before ``start()`` has returned one to the test. Only
+    one session is ever registered on these managers, so the listing is it.
+    """
+
+    def __init__(self, client: FakeClient, *, max_retries: int = 4) -> None:
+        super().__init__(client, max_retries=max_retries)
+        self.manager: SessionManager | None = None
+        self.readings: list[SessionInfo] = []
+
+    def __call__(
+        self,
+        config: AgentConfig,
+        *,
+        on_event: Callable[[AgentEvent], None],
+        cancel: Callable[[], bool],
+        on_llm_call: Callable[[LLMCallRecord], None],
+    ) -> CrosswordAgent:
+        def watched(record: LLMCallRecord) -> None:
+            on_llm_call(record)
+            assert self.manager is not None, "the factory was never given its manager"
+            self.readings.extend(self.manager.list())
+
+        return super().__call__(
+            config, on_event=on_event, cancel=cancel, on_llm_call=watched
+        )
 
 
 class _GatedClient(FakeClient):
@@ -1530,6 +1781,57 @@ def test_a_session_solves_the_mini_puzzle_over_a_fake_client(
     assert json.loads(json.dumps(result)) == result
     assert result["fill"] == grid_rows(mini_puzzle, mini_puzzle.solution_letters())
     assert json.loads(json.dumps(log.snapshot()))  # the whole stream, as SSE sees it
+
+
+def test_the_live_counters_climb_onto_the_final_stats_and_never_off_them(
+    mini_puzzle: Puzzle, make_manager: ManagerFactory
+) -> None:
+    """The real agent, with two requests that come back with nothing.
+
+    ``batch_size=1`` makes one call per clue and ``max_retries=0`` makes the
+    first two of them give up instead of backing off, so the solve genuinely
+    emits records that were never billed -- which is the case that used to walk
+    the sidebar's call count two above the truth and then drop it back at the
+    end. Every reading the counters can take is checked, and the last one has to
+    *be* the authoritative figure rather than get corrected to it.
+    """
+    client = FakeClient(_answer_book(mini_puzzle), fail_times=2)
+    factory = _WatchedFactory(client, max_retries=0)
+    manager = make_manager(factory)
+    factory.manager = manager
+    info = manager.start(mini_puzzle, _offline_config(batch_size=1))
+    final = _finished(manager, info.id)
+
+    log = manager.log(info.id)
+    result = manager.result(info.id)
+    assert log is not None
+    assert result is not None
+    calls = [e.payload for e in log.since(0) if e.type == "llm_call"]
+    failed = [c for c in calls if c["error"]]
+    assert len(failed) == 2, f"the failures never happened: {[c['error'] for c in calls]}"
+    assert len(calls) > len(failed), "every request failed, so nothing was billed"
+
+    billed = int(result["stats"]["llm_calls"])
+    assert billed == len(calls) - len(failed), "the stats and the records disagree"
+    assert final.llm_calls == billed
+
+    readings = [*factory.readings, final]
+    assert len(readings) == len(calls) + 1, "a call record went unobserved"
+    assert max(r.llm_calls for r in readings) == billed, "the live count overshot"
+
+    for earlier, later in itertools.pairwise(readings):
+        assert later.llm_calls >= earlier.llm_calls, "the call count went backwards"
+        assert later.input_tokens >= earlier.input_tokens
+        assert later.output_tokens >= earlier.output_tokens
+        # ``_serialise`` rounds cost to five decimals, so the final reading can
+        # sit up to half of that quantum below the running sum it replaces. That
+        # is the serialiser's resolution, not drift in the accounting, so the
+        # cost series gets exactly that much slack and no more.
+        assert later.cost_usd >= earlier.cost_usd - 5e-6, "the cost went backwards"
+
+    assert final.cost_usd == pytest.approx(result["stats"]["cost_usd"])
+    assert final.input_tokens == result["stats"]["input_tokens"]
+    assert final.output_tokens == result["stats"]["output_tokens"]
 
 
 def test_a_session_stopped_inside_the_first_propose_pass_still_publishes(

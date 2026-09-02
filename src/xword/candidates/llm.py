@@ -31,7 +31,8 @@ whatever is watching it:
 
 * ``on_call`` receives one :class:`~xword.web.trace.LLMCallRecord` per request
   -- the system and user text actually sent, the tools offered, the tool call
-  that came back, tokens and latency. Token counts alone cannot answer "what
+  that came back, tokens, latency, and why any attempt before the last one
+  failed. Token counts alone cannot answer "what
   did you ask it and what did it say", which is the only question a trace
   exists to answer. The record is built inside ``_call``, the one point every
   request and every retry passes through, so no code path can issue a call
@@ -46,6 +47,7 @@ whatever is watching it:
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
 import math
 import random
@@ -55,6 +57,7 @@ import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 from uuid import uuid4
 
@@ -97,9 +100,34 @@ BACKOFF_JITTER = 0.25
 #: decorrelate this process's own concurrent retries, not be unpredictable.
 JITTER_SEED = 0x58574F52
 
+#: One failure's text is clipped to this before it enters a call record. An SDK
+#: error can carry a whole response body, and ``max_retries`` of those would
+#: dominate a session's log while adding nothing: the exception type and the
+#: start of its message are what identifies a rate limit, a timeout or a 400.
+MAX_ERROR_CHARS = 300
+
 #: Model families that reject ``temperature``/``top_p``/``top_k`` outright (the
 #: 4.6+ generation dropped sampling controls). Sending one is a 400, so the
 #: configured temperature is silently not sent to these.
+#:
+#: This list is only half the question. There are now *two* independent reasons
+#: the parameter may be unsendable, and both have to be clear before it goes
+#: out:
+#:
+#: 1. **The model rejects it** -- this list. A request carrying a temperature to
+#:    one of these families comes back a 400 from the API.
+#: 2. **The SDK no longer has it.** Sampling controls were removed from the
+#:    Messages endpoint, so ``Messages.create()`` in ``anthropic`` 1.x has no
+#:    ``temperature`` parameter at all and passing one raises ``TypeError``
+#:    locally, before any request is made. That failed *every* call on a model
+#:    not in this list while the default model, being on it, kept working --
+#:    which is how the regression stayed invisible until someone picked
+#:    ``claude-haiku-4-5`` out of the model selector and watched the solve fall
+#:    back to lexicon and crossings.
+#:
+#: Hence :func:`_sdk_accepts_temperature` rather than deleting the parameter:
+#: ``pyproject`` allows ``anthropic>=0.40``, where temperature is real and
+#: honoured, so this has to be a capability probe.
 _MODELS_WITHOUT_SAMPLING: tuple[str, ...] = (
     "claude-opus-5",
     "claude-opus-4-8",
@@ -119,6 +147,41 @@ _NON_ALPHA_RE = re.compile(r"[^A-Z]")
 
 def _supports_sampling(model: str) -> bool:
     return not any(model.startswith(prefix) for prefix in _MODELS_WITHOUT_SAMPLING)
+
+
+def _failure_text(exc: BaseException) -> str:
+    """One failed attempt as a line a trace reader can act on.
+
+    The type is the diagnosis -- ``RateLimitError`` and ``APITimeoutError`` call
+    for different responses -- so it leads, and the message follows for the
+    detail the type does not carry.
+    """
+    return f"{type(exc).__name__}: {exc}"[:MAX_ERROR_CHARS]
+
+
+@lru_cache(maxsize=1)
+def _sdk_accepts_temperature() -> bool:
+    """Whether the installed SDK's ``Messages.create`` still takes ``temperature``.
+
+    Cached, because the answer is a property of the installed package and cannot
+    change while the process runs; inspecting a signature per call would put
+    reflection on the path of every batch.
+
+    ``anthropic`` is imported here rather than at module scope for the same
+    reason :meth:`LLMCandidateSource._get_client` does it: ``import xword`` must
+    not pull the SDK in.
+
+    Fails safe. If the probe itself cannot answer -- the SDK is absent, or a
+    future version moves the class -- the answer is "no". Omitting a temperature
+    costs a solve its sampling setting; sending one the SDK cannot take costs
+    the solve every LLM call it was going to make.
+    """
+    try:
+        from anthropic.resources.messages import Messages
+
+        return "temperature" in inspect.signature(Messages.create).parameters
+    except Exception:  # noqa: BLE001 - any failure to probe means "do not send"
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -475,7 +538,7 @@ class LLMCandidateSource:
         Read off the payload rather than off the arguments that built it, so the
         record describes the request that actually went out -- including
         everything :meth:`_request_kwargs` decided on its own: the forced tool,
-        the disabled thinking, whether this model family accepts a temperature.
+        the disabled thinking, whether a temperature could be sent at all.
 
         Every message's text is joined rather than only the first user turn. The
         payload is single-turn today; if that changes the record should grow
@@ -520,6 +583,14 @@ class LLMCandidateSource:
         successful one buried under its own failures. A call that never
         succeeds yields that same single record, carrying the error.
 
+        Which is why the one record has to carry the *reasons* the earlier
+        attempts failed, in ``retry_errors``: ``attempts=3`` on its own reports
+        that a request was slow without saying what it was waiting on, and the
+        narration that does name the exception goes to ``on_event``, which the
+        agent does not wire. Losing it there left a web session with no record
+        of the failures anywhere -- the retries being exactly the calls a trace
+        is worth reading for.
+
         ``clue_ids`` is passed in because the choke point cannot infer it: the
         prompt has the slot ids in it, but re-parsing them back out to label a
         record would be inventing a second source of truth.
@@ -535,6 +606,11 @@ class LLMCandidateSource:
         started_at = time.time()
         clock = time.perf_counter()
         last: BaseException | None = None
+        # Every failure that was retried past, oldest first. ``last`` alone is
+        # overwritten each round, so it can only ever describe the final
+        # attempt -- and on the path where the call eventually succeeds it
+        # describes nothing at all.
+        retry_errors: list[str] = []
         cancelled = False
         attempts = 0
 
@@ -551,6 +627,7 @@ class LLMCandidateSource:
                     last = exc
                     break
                 last = exc
+                retry_errors.append(_failure_text(exc))
                 delay = self._sleep_for(attempt)
                 self._record_usage(retries=1)
                 self._emit(
@@ -577,6 +654,7 @@ class LLMCandidateSource:
                     cache_read_tokens=_usage_int(raw_usage, "cache_read_input_tokens"),
                     cache_write_tokens=_usage_int(raw_usage, "cache_creation_input_tokens"),
                     attempts=attempts,
+                    retry_errors=tuple(retry_errors),
                 )
             )
             return message
@@ -587,7 +665,9 @@ class LLMCandidateSource:
             self._emit(f"{label}: stopped, not retrying")
         else:
             self._record_usage(failures=1)
-            error = f"{type(last).__name__}: {last}" if last is not None else "no response"
+            # ``error`` is the attempt that ended it; the ones before it are in
+            # ``retry_errors``, so the record does not repeat the last failure.
+            error = _failure_text(last) if last is not None else "no response"
             self._emit(f"{label}: giving up after {self.max_retries} retries ({last!r})")
         self._emit_call(
             LLMCallRecord.build(
@@ -595,6 +675,7 @@ class LLMCandidateSource:
                 started_at=started_at,
                 duration_s=time.perf_counter() - clock,
                 attempts=attempts,
+                retry_errors=tuple(retry_errors),
                 error=error,
             )
         )
@@ -615,6 +696,12 @@ class LLMCandidateSource:
         * The hard pass leaves thinking on its adaptive default and lets the
           model choose the tool, because the prompt asks it to reason out loud
           first and a forced tool call would cut that off.
+
+        ``temperature`` is the one optional key, and it goes out only when both
+        the model and the installed SDK will take it -- see
+        :data:`_MODELS_WITHOUT_SAMPLING` for why that is two questions and not
+        one. Everything else here is a parameter ``Messages.create`` has had
+        throughout the version range ``pyproject`` allows.
         """
         kwargs: dict[str, Any] = {
             "model": self.model,
@@ -637,7 +724,7 @@ class LLMCandidateSource:
         else:
             kwargs["tool_choice"] = {"type": "tool", "name": ANSWER_TOOL_NAME}
             kwargs["thinking"] = {"type": "disabled"}
-        if _supports_sampling(self.model):
+        if _supports_sampling(self.model) and _sdk_accepts_temperature():
             kwargs["temperature"] = self.temperature
         return kwargs
 

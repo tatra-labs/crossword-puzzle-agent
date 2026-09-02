@@ -28,6 +28,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -377,3 +378,266 @@ def test_a_finished_session_result_carries_what_the_session_view_draws(
         "attempts", "error", "cached", "clue_ids", "round", "truncated",
     }
     assert emitted["prompt"], "the prompt the UI displays must not be empty"
+
+
+# --------------------------------------------------------------------------- #
+# Seams the four parallel fixes could not see
+#
+# Each fix below was made in one file by an agent that could not read the other
+# three. What is asserted here is only the agreement between them: the
+# credential names the client emits against the ones the server accepts, the two
+# enforcement points of one spend cap, a trace field added in one file and
+# serialised in another, and the element ids the page reads against the ones it
+# defines. A single-file test cannot fail for any of these, which is exactly why
+# they are the ones that break.
+# --------------------------------------------------------------------------- #
+
+
+def _web_app() -> Any:
+    """``app.py`` as a module. It lives at the repository root, not in ``src``."""
+    sys.path.insert(0, str(REPO_ROOT))
+    try:
+        import app as webapp
+    finally:
+        sys.path.remove(str(REPO_ROOT))
+    return webapp
+
+
+def _guarded_routes(webapp: Any) -> list[Any]:
+    """Every route whose handler calls ``_require_access``, found by reading it.
+
+    Deliberately not a transcribed list: a route added without a token check is
+    the failure this is watching for, and a list would have to be updated by the
+    same edit that forgot the check.
+    """
+    guarded = []
+    for route in webapp.app.routes:
+        endpoint = getattr(route, "endpoint", None)
+        if endpoint is None or getattr(route, "dependant", None) is None:
+            continue
+        try:
+            source = inspect.getsource(endpoint)
+        except OSError:  # pragma: no cover - only if app.py is not on disk
+            continue
+        if "_require_access(" in source:
+            guarded.append(route)
+    return guarded
+
+
+def test_every_guarded_route_takes_the_token_both_ways() -> None:
+    """A header *and* a query parameter, on all of them, or the page half-works.
+
+    ``EventSource`` cannot set a request header, so ``?token=`` is the only way
+    a browser can authenticate ``/api/sessions/{sid}/stream``; and ``fetch``
+    should not have to put a secret in a URL, so the header has to be there too.
+    A route that accepts only one of the two is reachable from only half the
+    client, which no test of either side alone would notice.
+    """
+    webapp = _web_app()
+    guarded = _guarded_routes(webapp)
+    assert len(guarded) >= 9, f"only {len(guarded)} routes check the token"
+    for route in guarded:
+        headers = {field.alias.lower() for field in route.dependant.header_params}
+        query = {field.alias for field in route.dependant.query_params}
+        assert "x-access-token" in headers, f"{route.path} cannot take the token as a header"
+        assert "token" in query, f"{route.path} cannot take the token as a query parameter"
+
+    paths = {route.path for route in guarded}
+    for read in (
+        "/api/sessions",
+        "/api/sessions/{sid}",
+        "/api/sessions/{sid}/events",
+        "/api/sessions/{sid}/stream",
+    ):
+        assert read in paths, f"{read} serves the token holder's prompts and is unguarded"
+
+
+def test_the_client_emits_the_credential_names_the_server_accepts() -> None:
+    """The other half of the same seam, read out of the JavaScript.
+
+    The names are taken from the running app rather than typed here, so renaming
+    the header on the server fails this test instead of failing in a browser --
+    which is where it would otherwise surface, and where a 401 on an event
+    stream is indistinguishable from a stream that simply ended.
+    """
+    webapp = _web_app()
+    stream = next(
+        route
+        for route in _guarded_routes(webapp)
+        if route.path == "/api/sessions/{sid}/stream"
+    )
+    header = next(field.alias for field in stream.dependant.header_params)
+    query = next(field.alias for field in stream.dependant.query_params if field.alias == "token")
+
+    source = STUDIO_JS.read_text(encoding="utf-8")
+    # FastAPI lower-cases the alias and HTTP header names are case-insensitive,
+    # so the comparison is too -- the page spells it X-Access-Token.
+    assert f'"{header}"' in source.lower(), f"the page never sends the {header} header"
+    assert f'"{query}="' in source, f"the page never appends ?{query}= for EventSource"
+    # The EventSource URL is the one that cannot carry a header, so the query
+    # form has to be attached to that URL specifically, not merely defined.
+    assert re.search(r"/stream\?cursor=[^;]*tokenParam", source), (
+        "the stream URL does not carry the token, so a guarded stream is unreachable"
+    )
+
+
+def test_one_number_caps_every_solve_the_deployment_pays_for() -> None:
+    """Sessions and the legacy routes admit against the same limit and the same
+    count, because two caps that disagree are worse than one that is too low.
+
+    ``SessionManager`` owns the sessions and ``_SolveAdmission`` owns the
+    in-request solves; the property that matters is that neither has a limit or
+    a total of its own.
+    """
+    webapp = _web_app()
+    assert webapp.manager._max_concurrent == webapp.MAX_CONCURRENT_SESSIONS, (
+        "the registry and the legacy routes are capped by different numbers"
+    )
+    sources = (REPO_ROOT / "app.py").read_text(encoding="utf-8")
+    sources += (REPO_ROOT / "src" / "xword" / "web" / "sessions.py").read_text(encoding="utf-8")
+    assert sources.count("XWORD_MAX_CONCURRENT_SESSIONS") == 1, (
+        "the cap is read from the environment in more than one place"
+    )
+
+    # The combined count, exercised: a full registry refuses a legacy solve even
+    # though the admission gate itself is holding nothing.
+    class _FullRegistry:
+        active = webapp.MAX_CONCURRENT_SESSIONS
+
+    admission = webapp._SolveAdmission()
+    real, webapp.manager = webapp.manager, _FullRegistry()
+    try:
+        with pytest.raises(webapp.HTTPException) as caught:
+            admission.acquire()
+        assert caught.value.status_code == 429
+        assert "not a way around it" in caught.value.detail
+        assert admission.live == webapp.MAX_CONCURRENT_SESSIONS, "a refusal took a slot"
+    finally:
+        webapp.manager = real
+
+
+def _finished_session(manager: SessionManager, sid: str, timeout: float = 20.0) -> SessionInfo:
+    """Poll until the session is terminal. There is no condition to wait on from
+    outside the manager, and a fake client finishes in milliseconds."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        info = manager.info(sid)
+        assert info is not None
+        if info.state in {"done", "error", "stopped"}:
+            return info
+        time.sleep(0.01)
+    raise AssertionError(f"session {sid} never finished")
+
+
+def test_the_retry_history_reaches_the_events_payload_as_json(
+    mini_puzzle: Puzzle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``retry_errors`` is declared in one file, populated in a second and
+    serialised into the wire payload by a third.
+
+    The whole chain runs here: the source retries a real (fake) client, the
+    record reaches ``SessionManager._on_llm_call``, and the dict the poll route
+    returns is checked with ``allow_nan=False`` -- the flag that turns a value
+    ``json.dumps`` emits happily and no browser can parse into a failure here
+    rather than in a fetch. The backoff is flattened because this is a test
+    about the record, not about how long a retry waits.
+    """
+    webapp = _web_app()
+    monkeypatch.setattr(LLMCandidateSource, "_sleep_for", lambda self, attempt: 0.0)
+    solution = mini_puzzle.solution or {}
+    book = {slot.clue: [(solution[slot.id], 0.9)] for slot in mini_puzzle.slots}
+    client = FakeClient(book, fail_times=2)
+
+    def factory(config: AgentConfig, *, on_event: Any, cancel: Any, on_llm_call: Any) -> Any:
+        source = LLMCandidateSource(
+            model=config.model,
+            k=config.candidates_per_clue,
+            batch_size=config.batch_size,
+            max_concurrency=1,
+            cache=None,
+            client=client,
+            on_call=on_llm_call,
+            cancel=cancel,
+        )
+        return CrosswordAgent(config, llm=source, on_event=on_event, cancel=cancel)
+
+    manager = SessionManager(serialise=webapp._serialise, agent_factory=factory, max_concurrent=3)
+    try:
+        started = manager.start(
+            mini_puzzle, AgentConfig(use_lexicon=False, max_rounds=1, batch_size=1)
+        )
+        info = _finished_session(manager, started.id)
+        log = manager.log(started.id)
+        assert log is not None
+        assert info.state == "done", f"the solve did not finish: {info.error}"
+
+        events = log.since(0)
+        calls = [event.payload for event in events if event.type == "llm_call"]
+        retried = [call for call in calls if call["attempts"] > 1]
+        assert retried, "no call was retried, so the field under test was never populated"
+        for call in retried:
+            assert len(call["retry_errors"]) == call["attempts"] - 1, (
+                "a retried call lost the reason one of its attempts failed"
+            )
+            assert all("ConnectionError" in line for line in call["retry_errors"])
+        for call in calls:
+            assert isinstance(call["retry_errors"], list), "the field crosses the wire as a list"
+
+        # Exactly the dict app.py's /events handler returns, parsed the way a
+        # browser has to parse it.
+        payload = {
+            "events": [event.as_dict() for event in events],
+            "cursor": log.cursor,
+            "closed": log.closed,
+            "dropped": log.dropped,
+            "session": info.as_dict(),
+        }
+        json.dumps(payload, allow_nan=False)
+    finally:
+        manager.shutdown()
+
+    # And the panel that exists to show it does read the field.
+    assert "retry_errors" in STUDIO_JS.read_text(encoding="utf-8"), (
+        "the record carries the retry history and the trace card never shows it"
+    )
+
+
+def test_the_page_only_reads_element_ids_it_also_defines() -> None:
+    """``$("x")`` against ``id="x"``, both directions.
+
+    A rename on either side is silent: ``$`` returns null and the next property
+    access throws inside an event handler, which the console records and the
+    page does not. The reverse direction is checked too, because an id nothing
+    reads is usually the other half of a rename.
+    """
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    js = STUDIO_JS.read_text(encoding="utf-8")
+    defined = set(re.findall(r'\bid="([^"]+)"', html))
+    read = set(re.findall(r'\$\(\s*"([^"]+)"\s*\)', js))
+    read |= set(re.findall(r'getElementById\(\s*"([^"]+)"\s*\)', js))
+    assert read - defined == set(), "studio.js reads element ids index.html does not define"
+    assert defined - read == set(), "index.html defines element ids nothing reads"
+
+
+def test_the_live_grid_cleans_answers_the_way_the_solver_does() -> None:
+    """The provisional-letter path mirrors ``_clean`` by hand, so the two
+    normalisations have to be compared as text; there is no shared constant to
+    import across the language boundary.
+
+    Drift here does not raise: the grid simply paints letters that never entered
+    the solve, in the panel whose whole claim is that it shows the solve.
+    """
+    from xword.candidates import llm as llm_mod
+
+    js = STUDIO_JS.read_text(encoding="utf-8")
+    pattern = re.search(r"const NON_ALPHA = /([^/]+)/g;", js)
+    assert pattern, "public/studio.js no longer defines the NON_ALPHA counterpart"
+    assert pattern.group(1) == llm_mod._NON_ALPHA_RE.pattern, (
+        "the page strips a different character class than LLMCandidateSource._clean"
+    )
+    # The length rejection is the other half: clipping a wrong-length answer
+    # paints a rejected one anyway, which is the shape this replaced.
+    assert "answer.length !== slot.cells.length" in js, (
+        "the grid no longer rejects the wrong-length answers the solver drops"
+    )
+    assert "Math.min(slot.cells.length" not in js, "the clip is back"

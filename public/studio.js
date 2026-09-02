@@ -102,6 +102,13 @@ const MAX_KEEP = 4000;
 const LEGACY_SID = "single-request";
 
 const STORE_KEY = "xword.studio.puzzle";
+const TOKEN_KEY = "xword.studio.token";
+
+/**
+ * Everything that is not a letter, stripped from a model answer exactly as
+ * `LLMCandidateSource._clean` (llm.py) strips it before the solver sees it.
+ */
+const NON_ALPHA = /[^A-Z]/g;
 
 // --------------------------------------------------------------------------
 // Tiny DOM helpers
@@ -157,6 +164,8 @@ const state = {
   heartbeat: null,
   ticks: 0,
   legacyRunning: false,
+  /** A failed stop or dismiss, held so a re-render does not wipe it. */
+  actionNotice: "",
   lastCard: null,
 };
 
@@ -262,6 +271,58 @@ function fmtRoughTime(secs) {
   return secs < 90 ? "~" + Math.round(secs) + "s" : "~" + Math.round(secs / 60) + " min";
 }
 
+// --------------------------------------------------------------------------
+// Access token
+//
+// Every route that spends money is gated by `_require_access`, which takes the
+// secret as an `X-Access-Token` header or a `?token=` query parameter, and on a
+// deployment that sets XWORD_ACCESS_TOKEN the read routes want it too. A page
+// served from a bare URL has neither, so the token comes from the URL the
+// operator handed out (`?token=<secret>`) and is remembered in localStorage so
+// a later reload without it still works. There is deliberately no input field:
+// the URL already carries the secret, and a second place to keep it is a second
+// place to leak it from.
+// --------------------------------------------------------------------------
+
+function readAccessToken() {
+  let fromUrl = "";
+  try {
+    fromUrl = (new URLSearchParams(location.search).get("token") || "").trim();
+  } catch {
+    /* no parseable location: fall through to whatever was cached */
+  }
+  if (fromUrl) {
+    try {
+      localStorage.setItem(TOKEN_KEY, fromUrl);
+    } catch {
+      /* private mode: the token works for this page load and is not cached */
+    }
+    return fromUrl;
+  }
+  try {
+    return (localStorage.getItem(TOKEN_KEY) || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+const ACCESS_TOKEN = readAccessToken();
+
+/** Request headers, with the credential attached when this page has one. */
+function authHeaders(extra) {
+  const headers = Object.assign({}, extra || {});
+  if (ACCESS_TOKEN) headers["X-Access-Token"] = ACCESS_TOKEN;
+  return headers;
+}
+
+/**
+ * `&token=` for a URL that cannot carry a header. EventSource is the only such
+ * caller in this file: it is handed a URL and nothing else.
+ */
+function tokenParam(sep) {
+  return ACCESS_TOKEN ? sep + "token=" + encodeURIComponent(ACCESS_TOKEN) : "";
+}
+
 /** Read an error message the server wrote, in preference to inventing one. */
 async function serverMessage(res) {
   try {
@@ -276,7 +337,7 @@ async function serverMessage(res) {
 }
 
 async function getJson(url) {
-  const res = await fetch(url, { headers: { Accept: "application/json" } });
+  const res = await fetch(url, { headers: authHeaders({ Accept: "application/json" }) });
   if (!res.ok) throw new Error(await serverMessage(res));
   return res.json();
 }
@@ -512,7 +573,14 @@ async function loadHealth() {
   if (state.durable && h.max_concurrent_sessions) {
     bits.push("At most " + h.max_concurrent_sessions + " solves at once.");
   }
-  if (h.access_token_required) bits.push("Starting a solve needs an access token.");
+  if (h.access_token_required) {
+    // Saying "a token is needed" and stopping there is part of why this page
+    // looked broken on a protected deployment: the reader could not tell how to
+    // supply one, and nothing was sending the one they had.
+    bits.push(ACCESS_TOKEN
+      ? "An access token is required, and this page has one."
+      : "An access token is required: reopen this page as ?token=<secret>.");
+  }
   $("deployLine").textContent = bits.join(" ");
 
   const note = $("ephemeralNote");
@@ -716,11 +784,29 @@ function renderSessions() {
   $("sessionEmpty").hidden = ids.length > 0;
 }
 
+/**
+ * Re-origin the ticking clock without losing the tick.
+ *
+ * `elapsedOf` reads `elapsed_s + (now - _seenAt)`, so `_seenAt` is the origin
+ * the tick accumulates from and restamping it alone throws that tick away: the
+ * displayed time snaps back to the last snapshot's figure, which is what a
+ * `step` event -- several per round -- used to do. So fold what is on screen
+ * into `elapsed_s` first, and take it as a floor: a server snapshot is measured
+ * before it travels here, so it can legitimately arrive a little behind what we
+ * already showed. A clock that runs slightly fast is a clock; one that jumps
+ * backwards reads as a fault in the solve.
+ */
+function stampElapsed(info, shown) {
+  info.elapsed_s = Math.max(Number(info.elapsed_s) || 0, shown);
+  info._seenAt = performance.now();
+}
+
 function upsertSession(info) {
   if (!info || !info.id) return null;
   const prev = state.sessions.get(info.id);
+  const shown = prev ? elapsedOf(prev) : 0;
   const merged = Object.assign({}, prev || {}, info);
-  merged._seenAt = performance.now();
+  stampElapsed(merged, shown);
   state.sessions.set(info.id, merged);
   if (!state.order.includes(info.id)) state.order.unshift(info.id);
   return merged;
@@ -729,8 +815,9 @@ function upsertSession(info) {
 function patchSession(sid, fields) {
   const info = state.sessions.get(sid);
   if (!info) return;
+  const shown = elapsedOf(info);
   Object.assign(info, fields);
-  info._seenAt = performance.now();
+  stampElapsed(info, shown);
 }
 
 // --------------------------------------------------------------------------
@@ -914,7 +1001,10 @@ function renderSessionMeta() {
 
   const rec = track(sid);
   const problem = $("sessionProblem");
-  const failure = rec.error || (info.state === "error" ? info.error : "");
+  // The action notice comes first: it is the newest thing the user did, and a
+  // session that already carries an error can still fail to be dismissed.
+  const failure = state.actionNotice || rec.error
+    || (info.state === "error" ? info.error : "");
   problem.hidden = !failure;
   if (failure) problem.textContent = failure;
 }
@@ -1355,6 +1445,19 @@ function buildCallBody(host, rec, cached) {
   add(rkv, el("dd", null, rec.stop_reason || "—"));
   add(rkv, el("dt", null, "attempts"));
   add(rkv, el("dd", null, String(rec.attempts ?? 1)));
+  // Sits next to the attempts count because it is the answer to the question
+  // that count raises. `error` is empty on this path -- the call succeeded --
+  // so without this the card reports a call that took several seconds and says
+  // nothing about what it spent them on, which is the one kind of call a trace
+  // is worth opening for. Oldest first, matching the record.
+  const retries = rec.retry_errors || [];
+  if (retries.length) {
+    add(result, textBlock(
+      retries.length === 1
+        ? "1 earlier attempt failed"
+        : retries.length + " earlier attempts failed",
+      retries.join("\n")));
+  }
   if (rec.text) add(result, textBlock("assistant text", rec.text));
   if (rec.error) {
     const box = add(result, el("p", "note err"));
@@ -1530,12 +1633,24 @@ function absorbCall(sid, call) {
   const store = track(sid).prov;
   for (const item of answers) {
     if (!item || typeof item !== "object") continue;
-    const slot = detail.slots.get(String(item.slot || ""));
+    // `_parse_batch` (llm.py) matches on `str(slot).strip().upper()`, so "1a"
+    // is a slot the solver accepted and put into beliefs. Look it up the same
+    // way, or the grid stays blank beside a trace card showing the answers that
+    // were taken.
+    const slot = detail.slots.get(String(item.slot || "").trim().toUpperCase());
     const best = Array.isArray(item.candidates) ? item.candidates[0] : null;
     if (!slot || !best || typeof best.answer !== "string") continue;
-    const answer = best.answer.toUpperCase();
-    const n = Math.min(slot.cells.length, answer.length);
-    for (let i = 0; i < n; i++) {
+    // Same normalisation and the same rejection as `_clean`: strip everything
+    // that is not A-Z, then require an exact fill. "ST. LOUIS" is STLOUIS to
+    // the solver and would otherwise paint a period and a space as letters,
+    // and a wrong-length candidate the solver discarded outright would paint
+    // its prefix -- letters that never entered the solve, in a panel whose
+    // whole claim is that it shows what the solve is doing. (`_clean`'s pattern
+    // check has no counterpart here: the pattern is the committed letters as of
+    // the request, which the trace does not carry.)
+    const answer = best.answer.toUpperCase().replace(NON_ALPHA, "");
+    if (answer.length !== slot.cells.length) continue;
+    for (let i = 0; i < answer.length; i++) {
       const [r, c] = slot.cells[i];
       store.set(cellKey(r, c), answer[i]);
     }
@@ -1577,7 +1692,8 @@ function attach(sid) {
   }
 
   const url = "/api/sessions/" + encodeURIComponent(sid)
-    + "/stream?cursor=" + encodeURIComponent(rec.cursor);
+    + "/stream?cursor=" + encodeURIComponent(rec.cursor)
+    + tokenParam("&");
   let es;
   try {
     es = new EventSource(url);
@@ -1607,6 +1723,14 @@ function attach(sid) {
     rec.closed = true;
     rec.dropped = data.dropped || rec.dropped;
     detach(sid);
+    // Confirm rather than trust. The frame says this connection is finished,
+    // and one cursor read settles whether the log was really drained before it
+    // was declared closed -- and re-reads `closed` from the server while it is
+    // at it, so a frame that arrived early does not retire the session here.
+    backfill(sid).then(() => {
+      if (state.open === sid) renderSessionView();
+      renderSessions();
+    });
     pollSessions();
   });
   es.onmessage = handle(null);
@@ -1654,6 +1778,53 @@ function onFrame(sid, name, data) {
 }
 
 /**
+ * Read everything the log holds above our cursor, through the same ingest path
+ * the stream uses.
+ *
+ * Shared by the poll fallback and by opening a session, which is the point:
+ * catching up is a cursor read, not a resume branch. `closed` is *assigned*
+ * rather than only set, because the flag in this response is the server's
+ * answer about the log we have just drained; a client that latched `closed`
+ * from a stream frame would otherwise refuse to watch that session ever again.
+ */
+async function readEvents(sid) {
+  const rec = track(sid);
+  const data = await getJson("/api/sessions/" + encodeURIComponent(sid)
+    + "/events?cursor=" + encodeURIComponent(rec.cursor));
+  for (const ev of data.events || []) onFrame(sid, ev.type, ev);
+  if (data.session) upsertSession(data.session);
+  if (data.dropped) rec.dropped = data.dropped;
+  rec.closed = !!data.closed;
+  return data;
+}
+
+/**
+ * Catch the trace up: read the tail, unconditionally.
+ *
+ * The log replays from any cursor and outlives the solve, so a local cursor
+ * behind the server's just means events we have not read: we were detached
+ * while the session ran, or a stream frame called the log closed a beat early.
+ * Both are the same fetch, and it does not matter whether the session is still
+ * live -- which is the point. The guard that used to sit at the attach below
+ * watched a session only while it was live or had never been read, so one that
+ * finished while the user was looking elsewhere kept whatever prefix was on
+ * screen when they left, for the life of the page.
+ *
+ * It reads even when the snapshot says we are current, because that snapshot
+ * can be two seconds old and skipping wrongly is precisely the frozen-trace
+ * bug. An empty slice costs one small request; a missed tail costs the rest of
+ * the trace.
+ */
+async function backfill(sid) {
+  if (sid === LEGACY_SID) return;
+  try {
+    await readEvents(sid);
+  } catch {
+    /* the trace stays short: the next open, poll or attach tries again */
+  }
+}
+
+/**
  * The documented poll fallback, used when EventSource is unavailable or has
  * failed repeatedly. Same cursor, same events, more requests.
  */
@@ -1662,19 +1833,12 @@ function startEventPoll(sid) {
   if (rec.poll) return;
   const once = async () => {
     try {
-      const data = await getJson("/api/sessions/" + encodeURIComponent(sid)
-        + "/events?cursor=" + encodeURIComponent(rec.cursor));
-      for (const ev of data.events || []) onFrame(sid, ev.type, ev);
+      const data = await readEvents(sid);
       if (data.session) {
-        upsertSession(data.session);
         renderSessions();
         if (state.open === sid) renderSessionView();
       }
-      if (data.dropped) rec.dropped = data.dropped;
-      if (data.closed) {
-        rec.closed = true;
-        detach(sid);
-      }
+      if (rec.closed) detach(sid);
     } catch {
       /* a failed poll is not fatal: the next tick tries again */
     }
@@ -1704,10 +1868,37 @@ function inspectProblem(message) {
   box.textContent = message;
 }
 
+/**
+ * Report a failed stop or dismiss where the user is actually looking.
+ *
+ * `#inspectProblem` is a child of `#inspectView`, which showView() hides while
+ * the session view is up, so writing there from the session view put the
+ * message in a hidden subtree: the pill still said "running", the button stayed
+ * enabled, and a 401 or a 404 read as a button that does nothing. The session
+ * view has its own box, `#sessionProblem`. The text is parked on
+ * `state.actionNotice` as well, because renderSessionMeta runs on every poll
+ * and would otherwise clear the box a second later.
+ */
+function actionProblem(sid, message) {
+  const info = infoOf(sid);
+  // In the session view only the open session's box is visible, so a failure
+  // about a different session -- stopped or dismissed from its sidebar row --
+  // has to name the one it is about.
+  state.actionNotice = state.open === sid || !info
+    ? message
+    : info.puzzle_id + ": " + message;
+  if (state.view === "session") {
+    renderSessionMeta();
+    return;
+  }
+  inspectProblem(state.actionNotice);
+}
+
 async function startSolve() {
   if (!state.selected) return;
   const btn = $("solveBtn");
   $("inspectProblem").hidden = true;
+  state.actionNotice = "";
 
   if (!state.durable) {
     startLegacySolve();
@@ -1718,7 +1909,7 @@ async function startSolve() {
   try {
     const res = await fetch("/api/sessions", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(solveBody()),
     });
     if (!res.ok) {
@@ -1742,6 +1933,7 @@ async function startSolve() {
 async function openSession(sid) {
   detachAll();
   state.open = sid;
+  state.actionNotice = "";
   const rec = track(sid);
 
   let info = infoOf(sid);
@@ -1776,8 +1968,15 @@ async function openSession(sid) {
   if (state.open !== sid) return;
   renderSessionGrid();
 
-  const watchable = info && !rec.closed && (rec.cursor === 0 || LIVE.has(info.state));
-  if (sid !== LEGACY_SID && watchable) attach(sid);
+  await backfill(sid);
+  if (state.open !== sid) return;
+  renderSessions();
+  renderSessionView();
+
+  // Subscribe only to a session that can still produce events. The tail of a
+  // finished one has just been replayed, so there is nothing to wait for.
+  const current = infoOf(sid);
+  if (sid !== LEGACY_SID && current && LIVE.has(current.state)) attach(sid);
 }
 
 function closeSession() {
@@ -1789,12 +1988,14 @@ function closeSession() {
 }
 
 async function stopSession(sid) {
+  state.actionNotice = "";
   try {
     const res = await fetch(
-      "/api/sessions/" + encodeURIComponent(sid) + "/stop", { method: "POST" },
+      "/api/sessions/" + encodeURIComponent(sid) + "/stop",
+      { method: "POST", headers: authHeaders() },
     );
     if (!res.ok) {
-      inspectProblem(await serverMessage(res));
+      actionProblem(sid, await serverMessage(res));
       return;
     }
     const data = await res.json();
@@ -1802,20 +2003,24 @@ async function stopSession(sid) {
     renderSessions();
     if (state.open === sid) renderSessionView();
   } catch (err) {
-    inspectProblem("Could not stop that session: " + (err.message || err));
+    actionProblem(sid, "Could not stop that session: " + (err.message || err));
   }
 }
 
 async function deleteSession(sid) {
+  state.actionNotice = "";
   detach(sid);
   try {
-    const res = await fetch("/api/sessions/" + encodeURIComponent(sid), { method: "DELETE" });
+    const res = await fetch(
+      "/api/sessions/" + encodeURIComponent(sid),
+      { method: "DELETE", headers: authHeaders() },
+    );
     if (!res.ok && res.status !== 404) {
-      inspectProblem(await serverMessage(res));
+      actionProblem(sid, await serverMessage(res));
       return;
     }
   } catch (err) {
-    inspectProblem("Could not dismiss that session: " + (err.message || err));
+    actionProblem(sid, "Could not dismiss that session: " + (err.message || err));
     return;
   }
   state.sessions.delete(sid);
@@ -1889,7 +2094,7 @@ async function startLegacySolve() {
   try {
     const res = await fetch("/api/solve/stream", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(solveBody()),
     });
     if (!res.ok || !res.body) {
@@ -1956,6 +2161,10 @@ async function startLegacySolve() {
     btn.disabled = !canSolve();
     renderSessions();
     if (state.open === LEGACY_SID) renderSessionView();
+    // The happy path ends without a terminal status event -- the result frame
+    // patches the state directly -- so nothing in ingest() retires the 1Hz
+    // heartbeat this solve started. Do it here, where every exit passes.
+    if (!anyLive()) stopHeartbeat();
   }
 }
 
@@ -1970,7 +2179,14 @@ async function startLegacySolve() {
 // --------------------------------------------------------------------------
 
 async function pollSessions() {
-  if (!state.durable) return;
+  if (!state.durable) {
+    // There is no session listing to poll on this deployment, but the legacy
+    // solve does start the heartbeat (from its own `running` status event), and
+    // this early return is the reason nothing ever stopped it. Honour the
+    // invariant in the comment above here as well.
+    if (!anyLive()) stopHeartbeat();
+    return;
+  }
   let data;
   try {
     data = await getJson("/api/sessions");
