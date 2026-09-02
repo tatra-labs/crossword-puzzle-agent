@@ -251,9 +251,12 @@ async function boot() {
     health = await (await fetch("/api/health")).json();
     const list = await (await fetch("/api/puzzles")).json();
     const sel = $("puzzle");
-    sel.innerHTML = list.puzzles.map(p =>
-      `<option value="${p.id}" ${p.fits_here ? "" : "disabled"}>${p.id} — ${p.size}, ${p.entries} entries${p.fits_here ? "" : " (too big)"}</option>`
-    ).join("");
+    sel.innerHTML = list.puzzles.map(p => {
+      const note = !p.fits_here ? " — too big for this deployment"
+                 : p.slow ? " — slower, ~1 min" : "";
+      return `<option value="${p.id}" ${p.fits_here ? "" : "disabled"}>` +
+             `${p.id} — ${p.size}, ${p.entries} entries${note}</option>`;
+    }).join("");
     $("limits").textContent =
       `Function limit ${health.function_max_seconds}s, solve budget ${health.solve_budget_seconds}s. ` +
       `Lexicon ${health.lexicon_entries.toLocaleString()} entries${health.lexicon_is_fallback ? " (built-in fallback)" : ""}. ` +

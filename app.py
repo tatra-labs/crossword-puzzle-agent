@@ -89,9 +89,11 @@ SOLVE_BUDGET = max(5, FUNCTION_MAX_SECONDS - RESERVE_SECONDS)
 MAX_OPEN_CELLS = int(os.environ.get("XWORD_MAX_OPEN_CELLS", "200"))
 MAX_CLUES = int(os.environ.get("XWORD_MAX_CLUES", "90"))
 
-#: Above this, a solve is allowed but flagged as likely to run long or come
-#: back partial. Comfortably clears the 9x9/11x11 bundled puzzles.
-SLOW_OPEN_CELLS = 90
+#: Above this, a solve is allowed but flagged in the listing as slower. Set at
+#: 55 so the bundled 9x9s and the 11x11 are marked: measured, a 5x5 returns in
+#: ~8s and a 7x7 in ~11s, but a 9x9 takes tens of seconds, which is worth
+#: warning about before someone clicks and assumes it has hung.
+SLOW_OPEN_CELLS = int(os.environ.get("XWORD_SLOW_OPEN_CELLS", "55"))
 
 app = FastAPI(
     title="crossword-puzzle-agent",
@@ -341,6 +343,11 @@ def puzzles() -> JSONResponse:
                 "slow": len(p.open_cells) > SLOW_OPEN_CELLS,
             }
         )
+    # Smallest first, so the default selection in any UI is the one that
+    # returns in seconds rather than a 9x9 that takes a minute. Alphabetical
+    # order put `maxi-01` at the top, which made the first click the slowest
+    # possible experience.
+    out.sort(key=lambda p: (p["open_cells"], p["id"]))
     return JSONResponse({"puzzles": out})
 
 
