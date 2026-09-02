@@ -28,6 +28,13 @@ dependencies = [
     "httpx>=0.27",
     "tqdm>=4.66",
     "fastapi>=0.117.1",
+    # FastAPI declares no server of its own, and `python -m uvicorn app:app` is
+    # the documented way to run the studio UI locally. It is a main dependency
+    # rather than an extra so that the command in the README works after a
+    # plain `pip install -e .` -- it was previously satisfied only by whatever
+    # happened to be on the machine. Vercel installs from requirements.txt and
+    # supplies its own ASGI server, so this does not reach the deployment.
+    "uvicorn>=0.30",
 ]
 
 [project.optional-dependencies]

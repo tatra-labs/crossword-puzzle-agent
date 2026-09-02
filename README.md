@@ -125,20 +125,79 @@ or export it in your shell. A shell variable always wins over the file.
 
 ---
 
-## Deploying the web demo
+## The studio UI
 
-`python -m uvicorn app:app --port 8000` serves a three-panel studio: puzzles on
-the left, the grid and clues in the middle, and on the right the agent's full
-trace — every prompt, tool call and result — for sessions that keep running
-while you go and look at another puzzle. Those sessions are threads in the
-server process, so that part is local-only; **[docs/UI.md](docs/UI.md)** covers
-the panels, the concurrency cap, and what the deployed app does instead.
+A three-panel page for driving the agent by hand and reading what it actually
+sent the model. Two commands from a fresh clone:
 
-There is a FastAPI surface (`app.py`) and a demo page (`public/index.html`) that
-stream the agent's trace while it solves. Import the repo in Vercel, set
-`ANTHROPIC_API_KEY`, and **enable Fluid Compute** — without it the 10s Hobby
-function ceiling kills every solve but the smallest mini, since a 15x15 measures
-116-216s.
+```bash
+pip install -e .                       # brings fastapi + uvicorn with it
+python -m uvicorn app:app --port 8000
+```
+
+Then open <http://127.0.0.1:8000>. There is no build step — no `npm install`, no
+bundler; `public/studio.js` is one plain ES module and `public/studio.css` is
+plain CSS, both served from `/static/`.
+
+You need `ANTHROPIC_API_KEY` set (in `.env` or the environment) before a solve
+will start. Without it the page still loads, lists the puzzles and lets you
+inspect them, and the Solve button is disabled and says why. `GET /api/health`
+is the same check in JSON.
+
+### What the three panels do
+
+| Panel | Holds |
+|---|---|
+| **Left** | The ten bundled puzzles, smallest first, then every live and finished session with its state, a ticking clock, and its current round and step. A session keeps running here while you go and look at something else. |
+| **Centre** | The puzzle you are inspecting — empty grid, numbering, clues in two columns, hover highlighting both ways — or the session you are watching, with the grid filling in, a stats strip, and right/wrong marking once it finishes. |
+| **Right** | The trace. Phase steps as chips; each model call as a card that expands into the system prompt and clue batch **as sent**, the tool offered, the `tool_input` that came back, tokens and duration. |
+
+### A first run
+
+1. `mini-02` is selected by default — a 5×5, about 8 seconds and **$0.007**.
+2. Press **Solve**, and watch the right panel. Expand a `batch` card to see the
+   prompt and the model's ranked candidates with probabilities.
+3. While it runs, click another puzzle. The solve keeps going in the sidebar.
+   Click its row to come back — the trace is complete, not just the part that
+   happened after you returned.
+4. **stop** on a running row ends it at its next checkpoint and keeps the
+   partial grid. **dismiss** on a finished row forgets it.
+
+**Every solve spends real credit.** Roughly $0.007 for a 5×5 and ~$0.65 for a
+15×15; the button says what the selected puzzle will cost before you press it.
+
+### Knobs
+
+```bash
+python -m uvicorn app:app --port 8000 --reload      # reload on edit
+XWORD_MAX_CONCURRENT_SESSIONS=1 python -m uvicorn app:app   # tighter spend cap (default 3)
+XWORD_ACCESS_TOKEN=<secret> python -m uvicorn app:app       # require a token
+XWORD_CACHE_DIR=/tmp/cold python -m uvicorn app:app         # cold clue cache
+```
+
+With a token set, every solve **and every session read** requires it — a trace
+carries the verbatim prompts, the answers and the cost, so reads are not free to
+give away. Open the page as `http://127.0.0.1:8000/?token=<secret>`; there is
+deliberately no input field. `/api/health`, the puzzle list and the page itself
+stay open so it can load and tell you that.
+
+The clue cache makes a re-solve of the same puzzle nearly instant and free, which
+is why a second run reports `0 model calls · $0.00`. Point `XWORD_CACHE_DIR`
+somewhere empty to force real calls.
+
+Sessions are threads in the server process, so **they are a local capability**.
+`/api/health` reports `durable_sessions`, and where it is false the page falls
+back to one solve per request. **[docs/UI.md](docs/UI.md)** covers the panels,
+the cap, the access-control story and what is degraded in more detail.
+
+---
+
+## Deploying to Vercel
+
+Import the repo, set `ANTHROPIC_API_KEY`, and **enable Fluid Compute** — without
+it the 10s Hobby function ceiling kills every solve but the smallest mini, since
+a 15x15 measures 116-216s. `app.py` is the ASGI entrypoint; `requirements.txt`
+is deliberately narrower than `pyproject.toml` to keep the bundle small.
 
 Full walkthrough, including the timeout table, the cost/access-control warning
 and what is degraded versus running locally: **[docs/DEPLOY.md](docs/DEPLOY.md)**.
@@ -253,14 +312,17 @@ the three JSON schemas just works.
 ## Development
 
 ```bash
-pytest                       # unit tests; the live-API tests are skipped by default
-pytest -m live               # the tests that really call the API (needs a key)
-ruff check src tests
+pytest                       # 390 tests, ~4s, no API key and no network
+ruff check src tests app.py
+node --check public/studio.js
 ```
 
 The whole pipeline is testable offline: `LLMCandidateSource` accepts an injected client and
 ships with a `FakeClient` that answers from a dictionary, so fusion, belief propagation,
-search, repair, and scoring all run deterministically with no API key.
+search, repair, the session registry and scoring all run deterministically with no API key.
+**No test in the suite calls the real API.** A `live` marker is registered in `pytest.ini`
+for tests that would, and `pytest -m live` currently selects nothing — the marker is there
+so that such a test cannot be added without opting in.
 
 ### Layout
 
