@@ -1,0 +1,40 @@
+{
+  "id": "mini-02",
+  "title": "Sounds New",
+  "author": "crossword-puzzle-agent",
+  "date": "2026-09-01",
+  "difficulty": "easy",
+  "source": "original",
+  "license": "CC0-1.0",
+  "grid": [
+    "##GNU",
+    "##REF",
+    "PHOTO",
+    "ROW##",
+    "YEN##"
+  ],
+  "clues": {
+    "across": {
+      "1": "African grazer that sounds brand-new?",
+      "4": "Whistle-blower on a court, for short",
+      "5": "Snapshot",
+      "7": "Tier of seats",
+      "8": "Strong craving"
+    },
+    "down": {
+      "1": "___-ups (adults)",
+      "2": "Tennis court divider",
+      "3": "Flying saucer, in brief",
+      "5": "Snoop",
+      "6": "Garden tool for weeding"
+    }
+  },
+  "meta": {
+    "size": "5x5",
+    "blocks": "8",
+    "entries": "10",
+    "symmetric": "true",
+    "clue_types": "straight definition, fill-in-the-blank, abbreviation, wordplay, crosswordese",
+    "notes": "Carries the set's introductory wordplay clue (1-Across) and two abbreviations."
+  }
+}

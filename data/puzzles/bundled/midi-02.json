@@ -1,0 +1,48 @@
+{
+  "id": "midi-02",
+  "title": "Fresh Air",
+  "author": "crossword-puzzle-agent",
+  "date": "2026-09-01",
+  "difficulty": "medium",
+  "source": "original",
+  "license": "CC0-1.0",
+  "grid": [
+    "##OAF##",
+    "#QUILT#",
+    "OUTDOOR",
+    "AIL#RAP",
+    "REALISM",
+    "#TWIST#",
+    "##SET##"
+  ],
+  "clues": {
+    "across": {
+      "1": "Big lug",
+      "4": "Patchwork bed covering",
+      "6": "Like a picnic or a hike",
+      "8": "Feel unwell",
+      "9": "Hip-hop genre",
+      "10": "Artistic movement depicting life as it is",
+      "12": "Chubby Checker dance",
+      "13": "___ in stone"
+    },
+    "down": {
+      "1": "Wild West bandits",
+      "2": "Help",
+      "3": "Bouquet seller",
+      "4": "Library rule",
+      "5": "Words before a clink of glasses",
+      "6": "Rowboat propeller",
+      "7": "Turntable speed measure, for short",
+      "11": "Fib"
+    }
+  },
+  "meta": {
+    "size": "7x7",
+    "blocks": "13",
+    "entries": "16",
+    "symmetric": "true",
+    "clue_types": "straight definition, fill-in-the-blank, abbreviation, plural agreement, crosswordese",
+    "notes": "Diamond of black squares; 6- and 10-Across cross both seven-letter downs."
+  }
+}

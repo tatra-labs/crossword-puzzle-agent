@@ -1,0 +1,34 @@
+# --- secrets ---
+.env
+*.key
+
+# --- fetched corpora (third-party copyright; never commit) ---
+data/puzzles/nyt/
+data/lexicon/lexicon.txt
+
+# --- caches and run artefacts ---
+.xword-cache/
+reports/
+*.jsonl
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- editors / os ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+data/lexicon/words_alpha.txt

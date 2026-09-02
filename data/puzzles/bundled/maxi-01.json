@@ -1,0 +1,64 @@
+{
+  "id": "maxi-01",
+  "title": "House Call",
+  "author": "crossword-puzzle-agent",
+  "date": "2026-09-01",
+  "difficulty": "hard",
+  "source": "original",
+  "license": "CC0-1.0",
+  "grid": [
+    "FLEA##HUM",
+    "LEASH#EGO",
+    "UNCLE#ALP",
+    "#THERAPY#",
+    "###EON###",
+    "#DEPICTS#",
+    "FOG#CHIEF",
+    "BOG#SOLAR",
+    "IRS##RELY"
+  ],
+  "clues": {
+    "across": {
+      "1": "Jumping parasite",
+      "5": "Sing without words",
+      "8": "Walker's tether",
+      "10": "Freudian self",
+      "11": "Cry of surrender",
+      "12": "Matterhorn, for one",
+      "13": "Sessions on a counselor's couch",
+      "15": "Longest division of geologic time",
+      "16": "Portrays in a painting",
+      "20": "London's famous haze",
+      "21": "Head of a fire department",
+      "23": "Mire where things get bogged down?",
+      "24": "___ panel",
+      "25": "Tax-collecting org.",
+      "26": "Depend (on)"
+    },
+    "down": {
+      "1": "Bug that brings a fever, for short",
+      "2": "Gave temporarily",
+      "3": "Apiece",
+      "4": "Out cold in bed",
+      "5": "Big pile",
+      "6": "Not easy on the eyes",
+      "7": "Floor-cleaning tool",
+      "9": "Daring deeds",
+      "14": "News program's main presenter",
+      "16": "It may be revolving",
+      "17": "Carton dozen",
+      "18": "Bathroom floor square",
+      "19": "Close tightly",
+      "20": "Crime-fighting org.",
+      "22": "Cook in oil"
+    }
+  },
+  "meta": {
+    "size": "9x9",
+    "blocks": "18",
+    "entries": "30",
+    "symmetric": "true",
+    "clue_types": "straight definition, fill-in-the-blank, abbreviation, wordplay, plural agreement, tense agreement, crosswordese",
+    "notes": "Pinwheel layout; contains at least one clue of every type used in this set."
+  }
+}

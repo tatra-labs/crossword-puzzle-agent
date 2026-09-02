@@ -1,0 +1,40 @@
+{
+  "id": "mini-03",
+  "title": "Crown Jewels",
+  "author": "crossword-puzzle-agent",
+  "date": "2026-09-01",
+  "difficulty": "easy",
+  "source": "original",
+  "license": "CC0-1.0",
+  "grid": [
+    "OAKS#",
+    "PLOT#",
+    "TIARA",
+    "#GLAD",
+    "#NAPS"
+  ],
+  "clues": {
+    "across": {
+      "1": "Acorn-bearing trees",
+      "5": "___ twist",
+      "6": "Jeweled headband worn by a princess",
+      "8": "Pleased",
+      "9": "Short daytime sleeps"
+    },
+    "down": {
+      "1": "Make a choice",
+      "2": "Line up",
+      "3": "Eucalyptus-eating marsupial",
+      "4": "Backpack shoulder band",
+      "7": "Commercials, informally"
+    }
+  },
+  "meta": {
+    "size": "5x5",
+    "blocks": "4",
+    "entries": "10",
+    "symmetric": "true",
+    "clue_types": "straight definition, fill-in-the-blank, plural agreement",
+    "notes": "Three plural entries (1-, 9-Across and 7-Down) all take plural clues."
+  }
+}

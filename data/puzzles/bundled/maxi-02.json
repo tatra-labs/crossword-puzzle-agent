@@ -1,0 +1,66 @@
+{
+  "id": "maxi-02",
+  "title": "Figure of Speech",
+  "author": "crossword-puzzle-agent",
+  "date": "2026-09-01",
+  "difficulty": "hard",
+  "source": "original",
+  "license": "CC0-1.0",
+  "grid": [
+    "JAB###BAY",
+    "USE#IRATE",
+    "GIG#THREW",
+    "#DAISY###",
+    "#END#MOP#",
+    "###IDEAL#",
+    "LABOR#SAD",
+    "ENEMY#INN",
+    "DYE###SEA"
+  ],
+  "clues": {
+    "across": {
+      "1": "Boxer's quick punch",
+      "4": "Body of water partly enclosed by land",
+      "7": "Employ",
+      "8": "___ customer (angry complainer)",
+      "10": "Musician's engagement",
+      "11": "Pitched, in the past",
+      "12": "Flower with white petals and a yellow center",
+      "14": "Finish",
+      "15": "Unruly head of hair?",
+      "18": "Perfect",
+      "20": "___ Day (September holiday)",
+      "23": "___ but true",
+      "25": "Opponent in war",
+      "26": "Roadside lodging",
+      "27": "Color for fabric",
+      "28": "The Mediterranean, for one"
+    },
+    "down": {
+      "1": "Big pitcher",
+      "2": "Remark to the audience",
+      "3": "Got started",
+      "4": "Pub",
+      "5": "Had dinner",
+      "6": "Evergreen often used in hedges",
+      "8": "Belonging to that thing",
+      "9": "Moon/June pairing",
+      "13": "Expression like 'kick the bucket'",
+      "16": "Green spot in the desert",
+      "17": "Jet",
+      "19": "Like a desert",
+      "20": "Guided",
+      "21": "Some, no matter which",
+      "22": "Hive dweller",
+      "24": "Genetic material, for short"
+    }
+  },
+  "meta": {
+    "size": "9x9",
+    "blocks": "21",
+    "entries": "32",
+    "symmetric": "true",
+    "clue_types": "straight definition, fill-in-the-blank, abbreviation, wordplay, tense agreement, crosswordese",
+    "notes": "Every entry is three or five letters; three clues are past-tense."
+  }
+}

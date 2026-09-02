@@ -1,0 +1,40 @@
+{
+  "id": "mini-04",
+  "title": "Second Chances",
+  "author": "crossword-puzzle-agent",
+  "date": "2026-09-01",
+  "difficulty": "easy",
+  "source": "original",
+  "license": "CC0-1.0",
+  "grid": [
+    "#VET#",
+    "RENEW",
+    "INTRO",
+    "PURSE",
+    "#EYE#"
+  ],
+  "clues": {
+    "across": {
+      "1": "Animal doctor, for short",
+      "4": "Extend, as a library loan",
+      "6": "Opening part of a song, informally",
+      "7": "Handbag",
+      "8": "Hurricane's calm center"
+    },
+    "down": {
+      "1": "Concert site",
+      "2": "Way in",
+      "3": "Curt and to the point",
+      "4": "Tear apart",
+      "5": "Deep sorrow"
+    }
+  },
+  "meta": {
+    "size": "5x5",
+    "blocks": "4",
+    "entries": "10",
+    "symmetric": "true",
+    "clue_types": "straight definition, abbreviation",
+    "notes": "Only four black squares; the three central across entries are all five letters."
+  }
+}

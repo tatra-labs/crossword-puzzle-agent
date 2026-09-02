@@ -1,0 +1,46 @@
+{
+  "id": "midi-01",
+  "title": "Comeback Story",
+  "author": "crossword-puzzle-agent",
+  "date": "2026-09-01",
+  "difficulty": "medium",
+  "source": "original",
+  "license": "CC0-1.0",
+  "grid": [
+    "###MASH",
+    "###AUTO",
+    "BLUNDER",
+    "RALLIED",
+    "ENTITLE",
+    "ACRE###",
+    "DEAR###"
+  ],
+  "clues": {
+    "across": {
+      "1": "Crush into a pulp, as potatoes",
+      "5": "Car, informally",
+      "6": "Embarrassing mistake",
+      "9": "Came back from behind",
+      "10": "Give the right to",
+      "11": "Unit of land equal to 4,840 square yards",
+      "12": "'___ Sir or Madam'"
+    },
+    "down": {
+      "1": "More macho",
+      "2": "Tax season inspection",
+      "3": "Alloy of iron and carbon",
+      "4": "Swarming crowd",
+      "6": "Toast, before toasting?",
+      "7": "Knight's jousting weapon",
+      "8": "Prefix meaning 'extreme'"
+    }
+  },
+  "meta": {
+    "size": "7x7",
+    "blocks": "12",
+    "entries": "14",
+    "symmetric": "true",
+    "clue_types": "straight definition, fill-in-the-blank, abbreviation, wordplay, tense agreement, comparative agreement",
+    "notes": "Stacked seven-letter across entries; 9-Across and 1-Down test tense and degree."
+  }
+}

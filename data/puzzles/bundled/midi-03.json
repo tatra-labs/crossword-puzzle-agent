@@ -1,0 +1,48 @@
+{
+  "id": "midi-03",
+  "title": "Handle With Care",
+  "author": "crossword-puzzle-agent",
+  "date": "2026-09-01",
+  "difficulty": "medium",
+  "source": "original",
+  "license": "CC0-1.0",
+  "grid": [
+    "###CAMP",
+    "#PROPEL",
+    "FRAGILE",
+    "LAP#ETA",
+    "ENTICED",
+    "SCORED#",
+    "HERE###"
+  ],
+  "clues": {
+    "across": {
+      "1": "Tent site, or deliberately over-the-top style?",
+      "5": "Drive forward",
+      "7": "Marked 'Handle with care'",
+      "8": "One circuit of a track",
+      "9": "Arrival time, for short",
+      "10": "Lured in",
+      "12": "Put points on the board",
+      "13": "'___ and now'"
+    },
+    "down": {
+      "1": "Gear tooth",
+      "2": "For each one",
+      "3": "Turned to liquid",
+      "4": "Beg in court",
+      "5": "Strut about",
+      "6": "Bird of prey, or a 'Jurassic Park' dinosaur",
+      "7": "Skin and muscle",
+      "11": "Wrath"
+    }
+  },
+  "meta": {
+    "size": "7x7",
+    "blocks": "9",
+    "entries": "16",
+    "symmetric": "true",
+    "clue_types": "straight definition, fill-in-the-blank, abbreviation, wordplay, tense agreement, crosswordese",
+    "notes": "Pinwheel of black squares. Three past-tense entries (10-, 12-Across and 3-Down) all take past-tense clues."
+  }
+}

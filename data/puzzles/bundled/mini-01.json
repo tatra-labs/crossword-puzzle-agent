@@ -1,0 +1,40 @@
+{
+  "id": "mini-01",
+  "title": "First Steps",
+  "author": "crossword-puzzle-agent",
+  "date": "2026-09-01",
+  "difficulty": "easy",
+  "source": "original",
+  "license": "CC0-1.0",
+  "grid": [
+    "##OAF",
+    "#UNDO",
+    "PRIDE",
+    "EGOS#",
+    "TEN##"
+  ],
+  "clues": {
+    "across": {
+      "1": "Clumsy dolt",
+      "4": "Ctrl+Z action",
+      "5": "Group of lions",
+      "6": "Inflated self-images",
+      "7": "___-gallon hat"
+    },
+    "down": {
+      "1": "Vegetable with layers",
+      "2": "Puts in, as an ingredient",
+      "3": "Adversary",
+      "4": "Sudden impulse",
+      "5": "Household animal"
+    }
+  },
+  "meta": {
+    "size": "5x5",
+    "blocks": "6",
+    "entries": "10",
+    "symmetric": "true",
+    "clue_types": "straight definition, fill-in-the-blank, plural agreement, tense agreement",
+    "notes": "Smallest of the bundled set; every entry is three to five letters."
+  }
+}
