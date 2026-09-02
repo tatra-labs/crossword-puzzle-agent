@@ -38,7 +38,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
-from xword.candidates.cache import ClueCache, cache_key
+from xword.candidates.cache import ClueCache, cache_key, context_digest
 from xword.candidates.prompts import (
     ANSWER_TOOL,
     ANSWER_TOOL_NAME,
@@ -471,7 +471,12 @@ class LLMCandidateSource:
             if self.cache is not None:
                 hit = self.cache.get(
                     cache_key(
-                        self.model, request.clue, request.length, request.pattern, mode
+                        self.model,
+                        request.clue,
+                        request.length,
+                        request.pattern,
+                        mode,
+                        context_digest(request.puzzle_meta, request.crossing_clues),
                     )
                 )
             if hit is not None:
@@ -525,6 +530,9 @@ class LLMCandidateSource:
                             request.length,
                             request.pattern,
                             mode,
+                            context_digest(
+                                request.puzzle_meta, request.crossing_clues
+                            ),
                         ),
                         candidates,
                     )

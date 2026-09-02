@@ -413,7 +413,34 @@ def _ablation_section(
                 "p_value": float(p_value),
             }
         )
+
+    _apply_holm(rows)
     return rows
+
+
+def _apply_holm(rows: list[dict[str, Any]]) -> None:
+    """Add a Holm-Bonferroni adjusted p-value to each ablation row, in place.
+
+    Every ablation is tested against the same baseline on the same puzzles, so
+    they form one family of hypotheses: with seven of them, the chance that at
+    least one clears p < 0.05 by luck alone is about 30%. Holm controls that
+    family-wise error rate and is uniformly more powerful than plain Bonferroni,
+    which is why ``docs/EVALUATION.md`` specifies it.
+
+    Both the raw and the adjusted value are kept. The raw one is what a reader
+    checks the arithmetic against; the adjusted one is what a claim should rest
+    on.
+    """
+    ordered = sorted(range(len(rows)), key=lambda i: rows[i]["p_value"])
+    m = len(ordered)
+    running = 0.0
+    for rank, index in enumerate(ordered):
+        # Holm step-down: the k-th smallest p is scaled by (m - k), and the
+        # sequence is made monotone so an adjusted value never decreases.
+        scaled = min(1.0, (m - rank) * rows[index]["p_value"])
+        running = max(running, scaled)
+        rows[index]["p_value_adjusted"] = running
+        rows[index]["p_family_size"] = m
 
 
 def _delta(value: Any, base: Any) -> float | None:
@@ -757,6 +784,7 @@ def to_markdown(run: EvalRun, summary: dict | None = None) -> str:
                     f"`{primary}` only",
                     "System only",
                     "McNemar p",
+                    "Holm p",
                     "n",
                 ],
                 [
@@ -769,6 +797,7 @@ def to_markdown(run: EvalRun, summary: dict | None = None) -> str:
                         str(row["baseline_only"]),
                         str(row["system_only"]),
                         _p_text(row["p_value"]),
+                        _p_text(row.get("p_value_adjusted", row["p_value"])),
                         str(row["n"]),
                     ]
                     for row in data["ablations"]
@@ -1147,6 +1176,7 @@ def to_html(run: EvalRun, summary: dict | None = None, *, puzzles: Any = None) -
                     f"<code>{_esc(primary)}</code> only",
                     "System only",
                     "McNemar p",
+                    "Holm p",
                     "n",
                 ],
                 [
@@ -1159,6 +1189,7 @@ def to_html(run: EvalRun, summary: dict | None = None, *, puzzles: Any = None) -
                         str(row["baseline_only"]),
                         str(row["system_only"]),
                         _p_text(row["p_value"]),
+                        _p_text(row.get("p_value_adjusted", row["p_value"])),
                         str(row["n"]),
                     ]
                     for row in data["ablations"]
@@ -1305,6 +1336,25 @@ def _delta_html(value: Any) -> str:
 # --------------------------------------------------------------------------- #
 
 
+def _json_safe(value: Any) -> Any:
+    """Replace non-finite floats with ``None`` so the output is valid JSON.
+
+    ``selective_accuracy`` reports ``nan`` where a confidence threshold admits
+    no cells, which is the honest answer in Python -- but ``json.dumps`` writes
+    it as a bare ``NaN`` token that is *not* valid JSON. Python's own loader
+    accepts it, so the breakage only shows up later, in ``jq`` or a browser, on
+    a file the report advertises as the machine-readable source of truth.
+    ``null`` says "undefined here" in a way every parser understands.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 def write_report(run: EvalRun, out_dir: Path, *, puzzles: Any = None) -> dict[str, Path]:
     """Write markdown, HTML and the machine-readable summary into ``out_dir``.
 
@@ -1325,7 +1375,8 @@ def write_report(run: EvalRun, out_dir: Path, *, puzzles: Any = None) -> dict[st
     paths["markdown"].write_text(to_markdown(run, summary), encoding="utf-8")
     paths["html"].write_text(to_html(run, summary, puzzles=puzzles), encoding="utf-8")
     paths["summary"].write_text(
-        json.dumps(summary, indent=2, sort_keys=False), encoding="utf-8"
+        json.dumps(_json_safe(summary), indent=2, sort_keys=False, allow_nan=False),
+        encoding="utf-8",
     )
     paths["run"].write_text(run.to_json(), encoding="utf-8")
     return paths

@@ -129,6 +129,7 @@ class CrosswordAgent:
         self._llm_injected = llm is not None
         self._hard_llm = None
         self._cache = None
+        self._usage_base: dict | None = None
         self._on_event = on_event
 
         # Exposed after a solve so the evaluation harness can measure *candidate
@@ -205,6 +206,58 @@ class CrosswordAgent:
             out.append((self.config.hard_clue_model, self._hard_llm))
         return out
 
+    def _usage_snapshot(self) -> dict[str, tuple[int, int, int, int, float]]:
+        """Cumulative counters for each source, as of right now."""
+        snap = {}
+        for model, source in self._active_sources():
+            usage = getattr(source, "usage", None)
+            if usage is None:
+                continue
+            snap[model] = (
+                usage.calls,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_hits,
+                usage.cost_usd,
+            )
+        return snap
+
+    def _apply_usage(self, stats: SolveStats) -> None:
+        """Record usage for *this puzzle only*.
+
+        ``LLMCandidateSource.usage`` accumulates over the lifetime of the
+        source, and an agent is meant to be reused across puzzles so the clue
+        cache and connection pool stay warm. Reading the counters directly would
+        therefore charge every puzzle for all its predecessors too -- the second
+        puzzle in a suite would report twice its real cost, the tenth ten times.
+        Differencing against a snapshot taken at the start of the solve is what
+        keeps per-puzzle cost honest.
+        """
+        base = self._usage_base or {}
+        calls = tokens_in = tokens_out = hits = 0
+        cost = 0.0
+        for model, source in self._active_sources():
+            usage = getattr(source, "usage", None)
+            if usage is None:
+                continue
+            was = base.get(model, (0, 0, 0, 0, 0.0))
+            d_calls = usage.calls - was[0]
+            d_in = usage.input_tokens - was[1]
+            d_out = usage.output_tokens - was[2]
+            d_hits = usage.cache_hits - was[3]
+            d_cost = usage.cost_usd - was[4]
+            calls += d_calls
+            tokens_in += d_in
+            tokens_out += d_out
+            hits += d_hits
+            cost += d_cost if d_cost > 0 else estimate_cost(model, d_in, d_out)
+
+        stats.llm_calls = calls
+        stats.input_tokens = tokens_in
+        stats.output_tokens = tokens_out
+        stats.cache_hits = hits
+        stats.cost_usd = cost
+
     # -- events ------------------------------------------------------------ #
 
     def _emit(
@@ -235,6 +288,9 @@ class CrosswordAgent:
         started = time.perf_counter()
         trace: list[AgentEvent] = []
         stats = SolveStats()
+
+        # Snapshot cumulative usage so this puzzle is charged only its own.
+        self._usage_base = self._usage_snapshot()
 
         index = index_puzzle(puzzle)
         self.last_index = index
@@ -318,7 +374,9 @@ class CrosswordAgent:
                 score=round(assignment.score, 3),
             )
 
-            if best_assignment is None or assignment.score > best_assignment.score:
+            if best_assignment is None or self._round_objective(
+                puzzle, assignment
+            ) > self._round_objective(puzzle, best_assignment):
                 best_assignment, best_bp = assignment, bp
 
             stats.rounds = rnd + 1
@@ -511,21 +569,7 @@ class CrosswordAgent:
             )
             per_source["llm"] = answers
 
-            # Totals span both sources, since a round may have used either.
-            stats.llm_calls = stats.input_tokens = stats.output_tokens = 0
-            stats.cache_hits = 0
-            stats.cost_usd = 0.0
-            for model, source in self._active_sources():
-                usage = getattr(source, "usage", None)
-                if usage is None:
-                    continue
-                stats.llm_calls += usage.calls
-                stats.input_tokens += usage.input_tokens
-                stats.output_tokens += usage.output_tokens
-                stats.cache_hits += usage.cache_hits
-                stats.cost_usd += usage.cost_usd or estimate_cost(
-                    model, usage.input_tokens, usage.output_tokens
-                )
+            self._apply_usage(stats)
 
             found = sum(1 for v in answers.values() if v)
             self._emit(
@@ -591,6 +635,25 @@ class CrosswordAgent:
 
     #: Quantile used for the early-stop test. Low on purpose -- see below.
     WEAKEST_QUANTILE = 0.05
+
+    #: Log-probability charged for an entry left without a word, when comparing
+    #: one round against another. Roughly log(6e-6): worse than any real
+    #: candidate, so filling an entry badly still beats not filling it.
+    UNFILLED_PENALTY = -12.0
+
+    def _round_objective(self, puzzle: Puzzle, assignment) -> float:
+        """Compare two rounds on a footing that does not reward blank squares.
+
+        ``Assignment.score`` sums log-probabilities over the entries that got a
+        word. Log-probabilities are negative, so an assignment that fills fewer
+        entries has fewer negative terms and therefore a *higher* total. Picking
+        the maximum of that raw score systematically prefers the emptiest grid,
+        which silently discards exactly the repair rounds this loop exists to
+        run. Charging every unfilled entry a fixed penalty restores the
+        comparison.
+        """
+        unfilled = max(0, len(puzzle.slots) - len(assignment.slot_answers))
+        return assignment.score + self.UNFILLED_PENALTY * unfilled
 
     def _grid_confidence(self, puzzle: Puzzle, assignment, bp) -> float:
         """How confident the agent is about the *weakest* part of the grid.

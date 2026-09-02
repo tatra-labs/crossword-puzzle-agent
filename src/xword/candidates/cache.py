@@ -23,7 +23,7 @@ import json
 import sqlite3
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from xword.config import DEFAULT_CACHE_PATH
@@ -43,8 +43,36 @@ CREATE TABLE IF NOT EXISTS clue_cache (
 """
 
 
+def context_digest(
+    puzzle_meta: Mapping[str, str] | None = None,
+    crossing_clues: Sequence[str] = (),
+) -> str:
+    """Short digest of the prompt context that is not the clue itself.
+
+    The batch prompt carries the puzzle's title, day of week and difficulty, and
+    the hard-clue prompt additionally lists the crossing clues. Both change what
+    the model is asked, so both have to reach the cache key -- otherwise one
+    puzzle's answers get served for another puzzle's identically-worded clue,
+    which is wrong quietly rather than loudly.
+
+    Only keys the prompts actually render are included, so an unrelated metadata
+    field cannot needlessly cost a cache miss.
+    """
+    meta = puzzle_meta or {}
+    parts = [f"{k}={meta[k]}" for k in ("title", "dow", "difficulty") if meta.get(k)]
+    parts.extend(f"x={c}" for c in crossing_clues if c)
+    if not parts:
+        return ""
+    return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
 def cache_key(
-    model: str, clue: str, length: int, pattern: str | None, mode: str
+    model: str,
+    clue: str,
+    length: int,
+    pattern: str | None,
+    mode: str,
+    context: str = "",
 ) -> str:
     """Stable content hash for one clue lookup.
 
@@ -57,11 +85,23 @@ def cache_key(
     cached entry happens to hold returns the smaller list rather than paying for
     a new call, which is the right trade for an eval harness that re-runs the
     same puzzles.
+
+    ``context`` carries whatever else the prompt renders -- see
+    :func:`context_digest`. It defaults to empty so a caller that genuinely has
+    no puzzle context keeps the old key.
     """
     clue_norm = " ".join(clue.split()).casefold()
     pattern_norm = (pattern or "").upper()
     blob = "\x1f".join(
-        (str(SCHEMA_VERSION), model, mode, str(length), pattern_norm, clue_norm)
+        (
+            str(SCHEMA_VERSION),
+            model,
+            mode,
+            str(length),
+            pattern_norm,
+            clue_norm,
+            context,
+        )
     )
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 

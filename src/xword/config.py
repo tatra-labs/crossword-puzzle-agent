@@ -83,15 +83,21 @@ DEFAULT_MODEL = os.environ.get("XWORD_MODEL", "claude-sonnet-5")
 #: roughly doubles the cost of a solve, so it is opt-in rather than default.
 HARD_CLUE_MODEL = os.environ.get("XWORD_HARD_MODEL", DEFAULT_MODEL)
 
-#: USD per million tokens, (input, output). Used only to report an estimated
-#: cost alongside accuracy -- the harness treats cost as a first-class axis, so
-#: it needs *some* number, but it is a published-rate estimate, not a bill.
+#: USD per million tokens, (input, output), at Anthropic first-party list price.
+#: Used only to report an estimated cost alongside accuracy -- the harness
+#: treats cost as a first-class axis, so it needs *some* number, but it is a
+#: published-rate estimate, not a bill. Rates differ on Bedrock/Vertex.
 PRICING: dict[str, tuple[float, float]] = {
     "claude-opus-5": (5.0, 25.0),
-    "claude-sonnet-5": (3.0, 15.0),
-    "claude-haiku-4-5-20251001": (1.0, 5.0),
+    "claude-sonnet-5": (2.0, 10.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-haiku-4-5": (1.0, 5.0),
 }
-FALLBACK_PRICING = (3.0, 15.0)
+
+#: Used for an unrecognised model id. Deliberately the most expensive current
+#: tier: an unknown model should over-estimate cost rather than quietly
+#: under-report it in an evaluation table.
+FALLBACK_PRICING = (5.0, 25.0)
 
 
 def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
