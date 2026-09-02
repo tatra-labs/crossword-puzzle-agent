@@ -3,11 +3,22 @@
 .env
 *.key
 
+# Local environments. These are gitignored, but .vercelignore is what the CLI
+# reads, so leaving them out here uploads them: a .venv from `pip install -e .`
+# measures ~300 MB on its own, and Vercel installs from requirements.txt anyway.
+.venv/
+venv/
+node_modules/
+package-lock.json
+
 # Third-party corpora and build artefacts (see .gitignore for why).
 data/puzzles/nyt/
 data/lexicon/
 .xword-cache/
 reports/
+
+# Frames from scripts/record-demo.js, if a run was interrupted before cleanup.
+.demo-frames/
 
 # Not needed to serve requests.
 tests/
