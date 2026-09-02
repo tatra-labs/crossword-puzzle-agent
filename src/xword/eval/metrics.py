@@ -632,7 +632,7 @@ def calibration(
     hits = [0] * bins
     conf_sums = [0.0] * bins
 
-    for raw, is_ok in zip(confidences, correct):
+    for raw, is_ok in zip(confidences, correct, strict=False):
         p = _clamp01(raw)
         which = min(int(p * bins), bins - 1)
         counts[which] += 1
@@ -691,7 +691,7 @@ def selective_accuracy(
     out: list[tuple[float, float, float]] = []
     for threshold in thresholds:
         t = float(threshold)
-        kept = [ok for c, ok in zip(values, flags) if c >= t]
+        kept = [ok for c, ok in zip(values, flags, strict=False) if c >= t]
         coverage = _ratio(len(kept), n)
         accuracy = float("nan") if not kept else _ratio(sum(kept), len(kept))
         out.append((t, coverage, accuracy))
@@ -721,8 +721,8 @@ def mcnemar(
         raise ValueError(
             f"paired test needs equal lengths, got {len(a_solved)} and {len(b_solved)}"
         )
-    a_only = sum(1 for x, y in zip(a_solved, b_solved) if bool(x) and not bool(y))
-    b_only = sum(1 for x, y in zip(a_solved, b_solved) if bool(y) and not bool(x))
+    a_only = sum(1 for x, y in zip(a_solved, b_solved, strict=False) if bool(x) and not bool(y))
+    b_only = sum(1 for x, y in zip(a_solved, b_solved, strict=False) if bool(y) and not bool(x))
     discordant = a_only + b_only
     if discordant == 0:
         return a_only, b_only, 1.0
@@ -768,7 +768,7 @@ def paired_bootstrap(
             f"paired bootstrap needs equal lengths, got {len(a)} and {len(b)}"
         )
     diffs = np.asarray(
-        [float(x) - float(y) for x, y in zip(a, b)], dtype=np.float64
+        [float(x) - float(y) for x, y in zip(a, b, strict=False)], dtype=np.float64
     )
     if diffs.size == 0:
         return (0.0, 0.0, 0.0)

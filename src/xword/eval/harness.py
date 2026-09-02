@@ -211,7 +211,7 @@ def _coerce(annotation: Any, value: Any) -> Any:
 
     if isinstance(value, (list, tuple)) and _is_sequence_origin(origin):
         if origin is tuple and args and args[-1] is not Ellipsis and len(args) == len(value):
-            items = [_coerce(a, v) for a, v in zip(args, value)]
+            items = [_coerce(a, v) for a, v in zip(args, value, strict=False)]
         else:
             inner = args[0] if args and args[0] is not Ellipsis else None
             items = [_coerce(inner, v) for v in value]

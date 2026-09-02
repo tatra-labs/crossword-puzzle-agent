@@ -18,6 +18,7 @@ Two design notes that matter downstream:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import sqlite3
@@ -229,10 +230,8 @@ class ClueCache:
             self._closed = True
             conns, self._conns = self._conns, []
         for conn in conns:
-            try:
+            with contextlib.suppress(sqlite3.Error):
                 conn.close()
-            except sqlite3.Error:
-                pass
         self._local = threading.local()
 
     # -- niceties ---------------------------------------------------------- #

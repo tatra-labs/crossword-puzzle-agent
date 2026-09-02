@@ -20,10 +20,20 @@ from typing import TYPE_CHECKING, Any
 __version__ = "0.1.0"
 
 if TYPE_CHECKING:  # pragma: no cover
-    from xword.config import AgentConfig
-    from xword.core.types import Candidate, Cell, Fill, Puzzle, Slot, SolveResult
-    from xword.io.loaders import load_puzzle
-    from xword.solver.agent import CrosswordAgent, solve_puzzle
+    # Redundant `X as X` aliases: these names *are* re-exported, but ``__all__``
+    # is built from ``_EXPORTS`` at runtime, so a linter cannot see the use and
+    # would offer to delete them. The alias form is the convention that marks an
+    # import as a deliberate re-export (PEP 484).
+    from xword.config import AgentConfig as AgentConfig
+    from xword.core.types import Candidate as Candidate
+    from xword.core.types import Cell as Cell
+    from xword.core.types import Fill as Fill
+    from xword.core.types import Puzzle as Puzzle
+    from xword.core.types import Slot as Slot
+    from xword.core.types import SolveResult as SolveResult
+    from xword.io.loaders import load_puzzle as load_puzzle
+    from xword.solver.agent import CrosswordAgent as CrosswordAgent
+    from xword.solver.agent import solve_puzzle as solve_puzzle
 
 _EXPORTS: dict[str, tuple[str, str]] = {
     "AgentConfig": ("xword.config", "AgentConfig"),

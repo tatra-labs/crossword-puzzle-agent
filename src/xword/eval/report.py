@@ -150,7 +150,7 @@ def _reliability(
         hi = (index + 1) / bins
         picked = [
             (c, bool(k))
-            for c, k in zip(confidences, correct)
+            for c, k in zip(confidences, correct, strict=False)
             if (c >= lo and c < hi) or (index == bins - 1 and c >= lo and c <= 1.0000001)
         ]
         if not picked:
@@ -189,7 +189,7 @@ def _selective(
     total = len(confidences)
     out: list[tuple[float, float, float]] = []
     for threshold in thresholds:
-        kept = [bool(k) for c, k in zip(confidences, correct) if c >= threshold]
+        kept = [bool(k) for c, k in zip(confidences, correct, strict=False) if c >= threshold]
         coverage = (len(kept) / total) if total else 0.0
         accuracy = (sum(1 for k in kept if k) / len(kept)) if kept else 0.0
         out.append((float(threshold), coverage, accuracy))
@@ -198,8 +198,8 @@ def _selective(
 
 def _mcnemar(a_solved: Sequence[bool], b_solved: Sequence[bool]) -> tuple[int, int, float]:
     """Exact binomial McNemar -- the fallback when metrics is unavailable."""
-    n01 = sum(1 for a, b in zip(a_solved, b_solved) if a and not b)
-    n10 = sum(1 for a, b in zip(a_solved, b_solved) if b and not a)
+    n01 = sum(1 for a, b in zip(a_solved, b_solved, strict=False) if a and not b)
+    n10 = sum(1 for a, b in zip(a_solved, b_solved, strict=False) if b and not a)
     n = n01 + n10
     if n == 0:
         return n01, n10, 1.0

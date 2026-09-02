@@ -241,7 +241,7 @@ def parse_nyt_json(payload: dict[str, Any], puzzle_id: str | None = None) -> Puz
     mismatches = 0
     for direction in _DIRECTIONS:
         suffix = "A" if direction == "across" else "D"
-        for number, answer in zip(ordered[direction], answers[direction]):
+        for number, answer in zip(ordered[direction], answers[direction], strict=False):
             if solution.get(f"{number}{suffix}") != answer:
                 mismatches += 1
 

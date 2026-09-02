@@ -159,7 +159,7 @@ def _top_posterior(bp: BPResult, slot_id: str) -> float:
 def _letter_logprob(bp: BPResult, slot: Slot, word: str) -> float:
     """How much BP's per-cell marginals like ``word``."""
     total = 0.0
-    for cell, char in zip(slot.cells, word):
+    for cell, char in zip(slot.cells, word, strict=False):
         marginal = bp.cell_marginals.get(cell)
         position = LETTER_INDEX.get(char)
         if marginal is None or position is None or position >= len(marginal):
@@ -371,7 +371,7 @@ def _forward_check(
 
 def _place(state: _State, slot: Slot, word: str, score: float) -> _State:
     letters = dict(state.letters)
-    for cell, char in zip(slot.cells, word):
+    for cell, char in zip(slot.cells, word, strict=False):
         letters[cell] = char
     answers = dict(state.answers)
     answers[slot.id] = word
@@ -535,9 +535,9 @@ def _state_from_assignment(
         slot = index.slot_by_id.get(slot_id)
         if slot is None or len(word) != slot.length:
             continue
-        if any(letters.get(cell, char) != char for cell, char in zip(slot.cells, word)):
+        if any(letters.get(cell, char) != char for cell, char in zip(slot.cells, word, strict=False)):
             continue
-        for cell, char in zip(slot.cells, word):
+        for cell, char in zip(slot.cells, word, strict=False):
             letters[cell] = char
         answers[slot_id] = word
         score = assignment.slot_scores.get(slot_id)
@@ -689,7 +689,7 @@ def _tear_out(state: _State, group: set[str], index: GridIndex) -> _State:
     scores = {sid: state.scores[sid] for sid in answers}
     letters: dict[Cell, str] = {}
     for slot_id, word in answers.items():
-        for cell, char in zip(index.slot_by_id[slot_id].cells, word):
+        for cell, char in zip(index.slot_by_id[slot_id].cells, word, strict=False):
             letters[cell] = char
     return _State(letters, answers, scores, float(sum(scores.values())))
 

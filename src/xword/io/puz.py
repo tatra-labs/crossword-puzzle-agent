@@ -147,11 +147,11 @@ def _masked_bytes(sums: PuzChecksums) -> bytes:
     parts = (sums.cib, sums.solution, sums.state, sums.text)
     low = bytes((value & 0xFF) for value in parts)
     high = bytes(((value >> 8) & 0xFF) for value in parts)
-    return bytes(m ^ b for m, b in zip(_MASK, low + high))
+    return bytes(m ^ b for m, b in zip(_MASK, low + high, strict=False))
 
 
 def _unmask(masked: bytes) -> tuple[int, int, int, int]:
-    plain = bytes(m ^ b for m, b in zip(_MASK, masked))
+    plain = bytes(m ^ b for m, b in zip(_MASK, masked, strict=False))
     values = tuple(plain[i] | (plain[i + 4] << 8) for i in range(4))
     return values  # type: ignore[return-value]
 
@@ -521,7 +521,7 @@ def read_puz_bytes(data: bytes, puzzle_id: str | None = None) -> Puzzle:
 
     across_clues: dict[int, str] = {}
     down_clues: dict[int, str] = {}
-    for (number, direction), clue in zip(entries, raw.clues):
+    for (number, direction), clue in zip(entries, raw.clues, strict=False):
         target = across_clues if direction == "across" else down_clues
         target[number] = clue
 

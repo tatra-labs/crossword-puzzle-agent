@@ -7,6 +7,7 @@ so that a reported number always has an exact command that reproduces it.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -48,10 +49,10 @@ def _make_console() -> Console:
         for stream in (sys.stdout, sys.stderr):
             reconfigure = getattr(stream, "reconfigure", None)
             if reconfigure is not None:
-                try:
+                # An exotic terminal that refuses the call keeps whatever
+                # encoding it had: a legacy code page beats failing to start.
+                with contextlib.suppress(ValueError, OSError):
                     reconfigure(encoding="utf-8", errors="replace")
-                except (ValueError, OSError):  # pragma: no cover - exotic terminals
-                    pass
         return Console(legacy_windows=False)
     return Console()
 

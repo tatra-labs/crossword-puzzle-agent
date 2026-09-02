@@ -309,7 +309,7 @@ def pattern_matches(pattern: str, word: str) -> bool:
     """True if ``word`` is consistent with ``pattern`` (``?`` matches anything)."""
     if len(pattern) != len(word):
         return False
-    return all(p == WILDCARD or p == w for p, w in zip(pattern, word))
+    return all(p in (WILDCARD, w) for p, w in zip(pattern, word, strict=False))
 
 
 def grid_rows(

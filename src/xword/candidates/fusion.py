@@ -478,12 +478,12 @@ def _admissible(answer: str, request: ClueRequest) -> bool:
     if request.length > 0 and len(answer) != request.length:
         return False
     pattern = request.pattern
-    if pattern and len(pattern) == len(answer) and not pattern_matches(pattern, answer):
-        return False
-    # A pattern whose length disagrees with the answer is a caller bug rather
-    # than evidence against the answer, so it is ignored instead of emptying
-    # the entry.
-    return True
+    if not pattern or len(pattern) != len(answer):
+        # A pattern whose length disagrees with the answer is a caller bug rather
+        # than evidence against the answer, so it is ignored instead of emptying
+        # the entry.
+        return True
+    return pattern_matches(pattern, answer)
 
 
 def _source_matches(configured: str, observed: str) -> bool:

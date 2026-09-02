@@ -158,7 +158,7 @@ class Puzzle:
             slot = by_id.get(slot_id)
             if slot is None:
                 continue
-            for cell, ch in zip(slot.cells, answer):
+            for cell, ch in zip(slot.cells, answer, strict=False):
                 out[cell] = ch
         return out
 
@@ -242,7 +242,7 @@ class Fill:
 
     def with_slot(self, slot: Slot, answer: str) -> Fill:
         merged = dict(self.letters)
-        for cell, ch in zip(slot.cells, answer):
+        for cell, ch in zip(slot.cells, answer, strict=False):
             merged[cell] = ch
         return Fill(merged)
 

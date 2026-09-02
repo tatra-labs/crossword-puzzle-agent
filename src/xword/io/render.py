@@ -278,7 +278,7 @@ def _letters_from_answers(puzzle: Puzzle, answers: Mapping[str, str]) -> dict[Ce
         slot = by_id.get(slot_id)
         if slot is None or not answer:
             continue
-        for cell, ch in zip(slot.cells, str(answer).upper()):
+        for cell, ch in zip(slot.cells, str(answer).upper(), strict=False):
             out[cell] = ch
     return out
 
@@ -711,13 +711,10 @@ def render_summary(
     for _ in range(2):
         grid.add_column(justify="right", style=STYLE_NUMBER, no_wrap=True)
         grid.add_column(no_wrap=True)
-    for (l_label, l_value), (r_label, r_value) in zip(left, right):
+    for (l_label, l_value), (r_label, r_value) in zip(left, right, strict=False):
         grid.add_row(l_label, l_value, r_label, r_value)
 
-    if answers:
-        border = STYLE_CORRECT if solved else "red3"
-    else:
-        border = STYLE_LINE
+    border = (STYLE_CORRECT if solved else "red3") if answers else STYLE_LINE
     return Panel(
         grid,
         title=Text("solve summary", style="bold"),

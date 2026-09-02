@@ -97,7 +97,7 @@ def _decode_cell(raw: object, block: str, empty: str) -> tuple[bool, int | None]
     if isinstance(raw, int):
         return False, (raw or None)
     text = str(raw).strip()
-    if text == block or text == BLOCK_CHAR:
+    if text in (block, BLOCK_CHAR):
         return True, None
     if text == empty or text == "":
         return False, None
@@ -133,7 +133,7 @@ def _rows_of(
     out: list[list[object]] = []
     for r, row in enumerate(raw):
         cells: list[object]
-        if isinstance(row, str) or isinstance(row, Sequence):
+        if isinstance(row, (str, Sequence)):
             cells = list(row)
         else:
             problems.append(f"'{label}' row {r} is {type(row).__name__}, expected a list")

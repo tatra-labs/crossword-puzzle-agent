@@ -189,7 +189,7 @@ def merge_scores(
 
     totals: dict[str, float] = {}
     divisors: dict[str, float] = {}
-    for source, weight in zip(sources, weights):
+    for source, weight in zip(sources, weights, strict=False):
         weight = float(weight)
         if weight <= 0.0:
             continue
