@@ -12,7 +12,8 @@ The fix is a web surface, which now exists:
 | File | Purpose |
 |---|---|
 | `app.py` | The entrypoint. Vercel's Python runtime loads the top-level `app` (a FastAPI ASGI app) and routes every request to it. |
-| `public/index.html` | The demo page: pick a puzzle, watch the agent's trace stream in, see the grid with a confidence heat-map. |
+| `public/index.html` | The page: puzzles and sessions on the left, the grid and clues in the middle, the agent's trace on the right. See [UI.md](UI.md). |
+| `public/studio.css`, `public/studio.js` | The client, served from `/static/`. No build step: plain CSS and one ES module. |
 | `requirements.txt` | Runtime dependencies — deliberately narrower than `pyproject.toml` (see [Bundle size](#bundle-size)). |
 | `vercel.json` | `maxDuration`, the `/tmp` cache paths, and `excludeFiles`. |
 | `.vercelignore` | Keeps `.env`, the NYT corpus and build artefacts out of the upload. |
@@ -146,6 +147,9 @@ Worth knowing before you judge the hosted demo:
   per-instance and evaporates; locally it makes re-runs free and byte-identical.
 - **No `xword eval`.** The evaluation harness needs the NYT corpus, which is
   never deployed. Evaluation is a local activity.
+- **No background sessions**, so no session list, no stopping a solve, and no
+  per-call trace: the page runs one solve inside one request instead. This is
+  the biggest difference between the hosted demo and running it locally.
 
 ---
 
@@ -159,6 +163,14 @@ Worth knowing before you judge the hosted demo:
 | `POST /api/solve` | Solve and return the finished grid. Blocking. |
 | `POST /api/solve/stream` | Server-sent events: one frame per agent step, then the result. |
 | `GET /api/docs` | Generated OpenAPI docs. |
+| `POST /api/sessions` and friends | Background solves with a re-subscribable trace. **501 here** — see below. |
+
+The session routes (`/api/sessions*`) are what the UI drives locally, and they
+are the one part of this API a Vercel Function cannot serve: it is frozen once
+it responds, so a solve on a background thread stops the moment the response is
+sent. `durable_sessions` is false whenever `VERCEL` is set, `POST /api/sessions`
+answers `501` rather than charging for a trace nobody can read back, and the
+page falls back to `/api/solve/stream`. [UI.md](UI.md) has the details.
 
 ```bash
 curl -s https://<your-deployment>/api/health | jq

@@ -127,6 +127,13 @@ or export it in your shell. A shell variable always wins over the file.
 
 ## Deploying the web demo
 
+`python -m uvicorn app:app --port 8000` serves a three-panel studio: puzzles on
+the left, the grid and clues in the middle, and on the right the agent's full
+trace — every prompt, tool call and result — for sessions that keep running
+while you go and look at another puzzle. Those sessions are threads in the
+server process, so that part is local-only; **[docs/UI.md](docs/UI.md)** covers
+the panels, the concurrency cap, and what the deployed app does instead.
+
 There is a FastAPI surface (`app.py`) and a demo page (`public/index.html`) that
 stream the agent's trace while it solves. Import the repo in Vercel, set
 `ANTHROPIC_API_KEY`, and **enable Fluid Compute** — without it the 10s Hobby
@@ -265,6 +272,7 @@ src/xword/
   solver/     belief propagation, constrained search, the agent loop
   io/         .puz / ipuz / NYT / native readers, terminal + HTML rendering
   eval/       metrics, suites, harness, reports
+  web/        the trace log and the session registry behind the UI
   cli.py      everything above, reachable as `xword <verb>`
 ```
 

@@ -197,6 +197,7 @@ Dependencies point one way, which is what keeps the pieces independently testabl
 
 ```
 core/{types,grid,beliefs}      ← no dependencies; pure data + geometry
+web/trace.py                   ← also dependency-free: trace log + call record
         ▲
 lexicon/{index,store,build}    ← numpy bitset pattern index
         ▲
@@ -207,15 +208,23 @@ solver/{beliefs,search}        ← inference and discrete optimisation
 solver/agent.py                ← the loop
         ▲
 io/, eval/, cli.py             ← boundaries: files, measurement, humans
+web/sessions.py, app.py        ← boundary: HTTP, and solves that outlive a request
 ```
 
 `core/beliefs.py` sits low precisely so that `candidates` and `solver` can both use
 `SlotBeliefs` without importing each other.
 
-Two seams exist for testing: `CandidateSource` is a protocol, and `LLMCandidateSource`
-accepts an injected client. A `FakeClient` answers from a dictionary, so the entire
-pipeline — fusion, BP, search, repair, scoring — runs offline and deterministically with no
-API key.
+`web/trace.py` is at the bottom rather than up with `web/sessions.py` for the same
+reason: `candidates/llm.py` emits one `LLMCallRecord` per model request, so the record
+type has to sit *below* the layer that produces it. That is only legal because
+`trace.py` imports nothing but the standard library — importing `candidates/llm.py`
+pulls in `web/trace.py` and stops there, never `web/sessions.py`.
+
+Three seams exist for testing: `CandidateSource` is a protocol, `LLMCandidateSource`
+accepts an injected client, and the `cancel` / `on_call` hooks let a caller observe and
+interrupt a solve without the solver knowing who is watching. A `FakeClient` answers from
+a dictionary, so the entire pipeline — fusion, BP, search, repair, scoring — runs offline
+and deterministically with no API key.
 
 ---
 

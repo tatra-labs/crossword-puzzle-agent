@@ -26,6 +26,22 @@ The streaming endpoint exists for the same reason: a 200-second request that
 sends nothing looks broken, and the agent's round-by-round trace is the most
 interesting thing about it anyway.
 
+Background sessions are a local capability
+------------------------------------------
+The studio UI wants solves that outlive the request that started them: start a
+puzzle, go and read a different one, come back to the trace, stop it from
+anywhere. ``SessionManager`` does that with a thread per solve and an
+append-only trace log, and it works for exactly as long as the process stays
+alive between requests.
+
+A Vercel Function does not. It is frozen once the response is sent, so a thread
+started during a request stops making progress, and the next request need not
+even reach this instance. So ``durable_sessions`` is false whenever ``VERCEL``
+is set: ``POST /api/sessions`` answers 501 there instead of charging for a
+trace nobody can read back, and the UI degrades to ``/api/solve/stream``, which
+is one solve inside one request. Run the app locally (``uvicorn app:app``) for
+the session behaviour.
+
 Filesystem note: everything outside ``/tmp`` is read-only on Vercel, and the
 agent writes a SQLite clue cache. ``vercel.json`` points ``XWORD_CACHE_DIR`` at
 ``/tmp``; this module also passes an explicit cache path so the deployment is
@@ -42,7 +58,8 @@ import secrets
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -58,13 +75,19 @@ if _SRC.is_dir() and str(_SRC) not in sys.path:
 os.environ.setdefault("XWORD_CACHE_DIR", "/tmp/xword-cache")
 os.environ.setdefault("XWORD_REPORT_DIR", "/tmp/xword-reports")
 
-from fastapi import FastAPI, Header, HTTPException  # noqa: E402
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse  # noqa: E402
+from fastapi import FastAPI, Header, HTTPException, Request  # noqa: E402
+from fastapi.responses import (  # noqa: E402
+    HTMLResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
 from pydantic import BaseModel, Field  # noqa: E402
 
 from xword import config as cfg  # noqa: E402
 from xword.core.grid import grid_rows, make_puzzle, validate_puzzle  # noqa: E402
 from xword.core.types import AgentEvent, Puzzle  # noqa: E402
+from xword.web.sessions import SessionInfo, SessionLimit, SessionManager  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # Deployment limits
@@ -95,11 +118,39 @@ MAX_CLUES = int(os.environ.get("XWORD_MAX_CLUES", "90"))
 #: warning about before someone clicks and assumes it has hung.
 SLOW_OPEN_CELLS = int(os.environ.get("XWORD_SLOW_OPEN_CELLS", "55"))
 
+#: Whether a solve may outlive the request that started it. A session is a
+#: thread and a log inside this process, both of which a frozen serverless
+#: instance loses, and a follow-up request is not guaranteed to reach the same
+#: instance anyway. The env var is a crude platform sniff, but it is the only
+#: signal available at import time and the cost of being wrong is one HTTP
+#: error and a fallback, not a broken deployment.
+DURABLE_SESSIONS = not bool(os.environ.get("VERCEL"))
+
+#: How many solves may run at once. Each is a thread holding an Anthropic key,
+#: so this cap is about spend and API rate limits rather than CPU: three
+#: concurrent 15x15s is already a few dollars in flight.
+MAX_CONCURRENT_SESSIONS = max(1, int(os.environ.get("XWORD_MAX_CONCURRENT_SESSIONS", "3")))
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Take the session threads down with the process.
+
+    A lifespan handler rather than ``@app.on_event("shutdown")``, which is
+    deprecated in the installed FastAPI (0.129) and scheduled for removal.
+    Without it, a Ctrl-C or a ``--reload`` restart leaves solve threads running
+    against a real API key with nothing left to read their traces.
+    """
+    yield
+    manager.shutdown()
+
+
 app = FastAPI(
     title="crossword-puzzle-agent",
     description="An AI agent that solves crossword puzzles.",
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
+    lifespan=_lifespan,
 )
 
 
@@ -260,6 +311,14 @@ def _serialise(puzzle: Puzzle, result: Any) -> dict[str, Any]:
     return payload
 
 
+#: The session registry, one per process. It is deliberately module-level
+#: rather than per-request state: that is the whole point -- a session has to
+#: still be there on the *next* request, and it is handed ``_serialise`` so a
+#: finished session's ``result`` event is byte-identical to what
+#: ``POST /api/solve`` returns for the same puzzle.
+manager = SessionManager(serialise=_serialise, max_concurrent=MAX_CONCURRENT_SESSIONS)
+
+
 #: Optional shared secret. A deployment of this app is a public URL that spends
 #: real money from your Anthropic key on every click, so if this is set the
 #: solve endpoints require it (header ``X-Access-Token`` or ``?token=``). Left
@@ -314,6 +373,11 @@ def health() -> JSONResponse:
             "solve_budget_seconds": SOLVE_BUDGET,
             "max_open_cells": MAX_OPEN_CELLS,
             "max_clues": MAX_CLUES,
+            # What the UI needs to decide between the session surface and the
+            # single-request fallback before the user clicks anything.
+            "durable_sessions": DURABLE_SESSIONS,
+            "max_concurrent_sessions": MAX_CONCURRENT_SESSIONS,
+            "active_sessions": manager.active,
             "python": sys.version.split()[0],
         }
     )
@@ -349,6 +413,68 @@ def puzzles() -> JSONResponse:
     # possible experience.
     out.sort(key=lambda p: (p["open_cells"], p["id"]))
     return JSONResponse({"puzzles": out})
+
+
+def _entries_view(puzzle: Puzzle, direction: str) -> list[dict[str, Any]]:
+    """One direction's clue list, numbered order, with each entry's start cell.
+
+    The start cell travels with the clue so the UI can highlight an entry
+    without re-deriving the numbering it was already sent.
+    """
+    return [
+        {
+            "id": s.id,
+            "number": s.number,
+            "clue": s.clue,
+            "length": s.length,
+            "row": s.start.row,
+            "col": s.start.col,
+        }
+        for s in sorted(
+            (s for s in puzzle.slots if s.direction == direction),
+            key=lambda s: s.number,
+        )
+    ]
+
+
+@app.get("/api/puzzles/{pid}")
+def puzzle_detail(pid: str) -> JSONResponse:
+    """One bundled puzzle in full, so inspecting it costs nothing and no money.
+
+    Everything the grid renderer and the clue list need, and nothing that
+    requires a solve. The answers are withheld even when the fixture has them
+    -- ``has_solution`` says scoring is possible, and the gold grid arrives
+    with a finished solve's result, not before it.
+    """
+    from xword.io.loaders import load_puzzle
+
+    found = _bundled().get(pid)
+    if found is None:
+        raise HTTPException(
+            404,
+            f"No bundled puzzle {pid!r}. Available: {', '.join(sorted(_bundled()))}",
+        )
+    p = load_puzzle(found)
+    open_cells = len(p.open_cells)
+    return JSONResponse(
+        {
+            "id": pid,
+            "title": p.meta.get("title", ""),
+            "difficulty": p.meta.get("difficulty", ""),
+            "size": f"{p.height}x{p.width}",
+            "width": p.width,
+            "height": p.height,
+            "entries": len(p.slots),
+            "open_cells": open_cells,
+            "fits_here": open_cells <= MAX_OPEN_CELLS and len(p.slots) <= MAX_CLUES,
+            "slow": open_cells > SLOW_OPEN_CELLS,
+            "has_solution": p.has_solution,
+            "shape": grid_rows(p, {}, blank="."),
+            "numbers": {f"{s.start.row},{s.start.col}": s.number for s in p.slots},
+            "across": _entries_view(p, "across"),
+            "down": _entries_view(p, "down"),
+        }
+    )
 
 
 @app.post("/api/solve")
@@ -441,6 +567,245 @@ async def solve_stream(
 
 def _sse(event: str, data: Any) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+# --------------------------------------------------------------------------- #
+# Sessions
+#
+# The same solve as /api/solve, except the work is owned by the process instead
+# of by one response. Starting is a POST that returns immediately; watching is
+# a separate, resumable subscription; and stopping is a third request that may
+# come from a page which has since navigated elsewhere. Reading a session needs
+# no access token -- only starting, stopping and deleting do, matching
+# /api/solve, where the token guards spending rather than information.
+# --------------------------------------------------------------------------- #
+
+
+def _session_or_404(sid: str) -> SessionInfo:
+    info = manager.info(sid)
+    if info is None:
+        raise HTTPException(
+            404,
+            f"No session {sid!r}. It was deleted, or this process was restarted -- "
+            "sessions live in memory and do not survive a redeploy.",
+        )
+    return info
+
+
+@app.post("/api/sessions")
+def create_session(
+    body: SolveRequest,
+    x_access_token: str | None = Header(default=None),
+    token: str | None = None,
+) -> JSONResponse:
+    """Start a solve in the background and return the session immediately.
+
+    Shares ``_load_request`` and ``_agent_config`` with ``/api/solve``, so the
+    size guard, the wall-clock budget and the model overrides cannot drift
+    between the two ways of starting the same work.
+
+    The durability check comes before the API key check on purpose: on a
+    platform that cannot hold a session, a missing key is not the interesting
+    problem, and answering 503 would send the UI looking for a configuration
+    fix that would not help.
+    """
+    _require_access(x_access_token or token)
+    if not DURABLE_SESSIONS:
+        raise HTTPException(
+            501,
+            "This deployment cannot run background sessions. A serverless function "
+            "is frozen once it responds, so the solve would stall the moment this "
+            "request returned, and a later poll could land on a different instance "
+            "that has never heard of the session. Use POST /api/solve/stream, which "
+            "completes a solve inside a single request, or run the app locally "
+            "(uvicorn app:app) for the session UI.",
+        )
+    _require_key()
+    puzzle = _load_request(body)
+    try:
+        info = manager.start(puzzle, _agent_config(body))
+    except SessionLimit as exc:
+        raise HTTPException(429, str(exc)) from exc
+    return JSONResponse(info.as_dict())
+
+
+@app.get("/api/sessions")
+def list_sessions() -> JSONResponse:
+    """Every session this process knows about, newest first."""
+    return JSONResponse(
+        {
+            "sessions": [i.as_dict() for i in manager.list()],
+            "max_concurrent": MAX_CONCURRENT_SESSIONS,
+            "durable": DURABLE_SESSIONS,
+        }
+    )
+
+
+@app.get("/api/sessions/{sid}")
+def session(sid: str) -> JSONResponse:
+    """One session, plus its finished grid once there is one.
+
+    ``result`` is null until the solve completes, which is what lets the UI use
+    a single request to restore the whole right-hand pane -- header, progress
+    and grid -- when a puzzle is reopened.
+    """
+    info = _session_or_404(sid)
+    return JSONResponse({"session": info.as_dict(), "result": manager.result(sid)})
+
+
+@app.get("/api/sessions/{sid}/events")
+def session_events(sid: str, cursor: int = 0) -> JSONResponse:
+    """Poll fallback for clients that cannot hold an SSE stream open.
+
+    Non-blocking by design: a long-poll would tie up a worker for as long as a
+    round takes, and it buys nothing here, because the cursor already
+    guarantees that a client polling every few seconds misses no events.
+    """
+    info = _session_or_404(sid)
+    log = manager.log(sid)
+    if log is None:
+        raise HTTPException(404, f"Session {sid!r} has no trace log.")
+    at = max(0, cursor)
+    events = log.since(at)
+    # Read the session state *after* the events. The other order can report
+    # "running" alongside the result event, and a client that trusts `state`
+    # over `closed` would then stop polling one beat too early.
+    info = manager.info(sid) or info
+    return JSONResponse(
+        {
+            "events": [e.as_dict() for e in events],
+            "cursor": events[-1].seq if events else at,
+            "session": info.as_dict(),
+            "closed": log.closed,
+            "dropped": log.dropped,
+        }
+    )
+
+
+@app.get("/api/sessions/{sid}/stream")
+async def session_stream(
+    sid: str, request: Request, cursor: int = 0
+) -> StreamingResponse:
+    """Replay the trace from ``cursor``, then tail it live until the log closes.
+
+    Reattaching is not a special case. A client that has seen 40 events asks
+    for everything since 40 and gets the gap followed by the tail, through the
+    same loop a client joining at 0 runs.
+
+    Two details this has to get right:
+
+    * ``TraceLog.wait_since`` blocks its thread. Called inline it would park
+      the event loop for up to a second at a time, stalling every other
+      request in the process, so it goes through ``asyncio.to_thread``.
+    * A subscriber who closes the tab leaves an async generator waiting on a
+      log that may never close. Checking ``request.is_disconnected()`` each
+      turn is what stops that becoming a thread leak per abandoned tab.
+    """
+    log = manager.log(sid)
+    if log is None:
+        raise HTTPException(
+            404,
+            f"No session {sid!r}. It was deleted, or this process was restarted.",
+        )
+
+    async def stream() -> AsyncIterator[str]:
+        at = max(0, cursor)
+        for event in log.since(at):
+            at = event.seq
+            yield _sse(event.type, event.as_dict())
+        while True:
+            if await request.is_disconnected():
+                return
+            pending = await asyncio.to_thread(log.wait_since, at, 1.0)
+            for event in pending:
+                at = event.seq
+                yield _sse(event.type, event.as_dict())
+            if pending:
+                continue
+            # wait_since returns nothing both on timeout and on a drained
+            # closed log; `closed` is the only thing that tells them apart.
+            if log.closed:
+                yield _sse("closed", {"cursor": at, "dropped": log.dropped})
+                return
+            # Idle: proxies (and Vercel) close a stream that says nothing.
+            yield ": keepalive\n\n"
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/sessions/{sid}/stop")
+def stop_session(
+    sid: str,
+    x_access_token: str | None = Header(default=None),
+    token: str | None = None,
+) -> JSONResponse:
+    """Ask a running solve to give up at its next checkpoint.
+
+    Cancellation is cooperative -- an in-flight model call is not aborted -- so
+    ``stopped`` means the request was accepted, not that the thread has already
+    finished. The returned session is read after the request, so a UI can show
+    ``stopping`` straight away rather than inventing that state itself.
+    """
+    _require_access(x_access_token or token)
+    info = _session_or_404(sid)
+    stopped = manager.stop(sid)
+    return JSONResponse(
+        {"stopped": stopped, "session": (manager.info(sid) or info).as_dict()}
+    )
+
+
+@app.delete("/api/sessions/{sid}")
+def delete_session(
+    sid: str,
+    x_access_token: str | None = Header(default=None),
+    token: str | None = None,
+) -> JSONResponse:
+    """Drop a session and its trace from the registry.
+
+    What happens to a still-running solve is the manager's business; this layer
+    only reports whether the id existed, so a double-click on a delete button
+    gets a 404 rather than a second, different answer.
+    """
+    _require_access(x_access_token or token)
+    if not manager.delete(sid):
+        raise HTTPException(404, f"No session {sid!r}.")
+    return JSONResponse({"deleted": True, "id": sid})
+
+
+# --------------------------------------------------------------------------- #
+# Static assets
+# --------------------------------------------------------------------------- #
+
+#: The studio's two assets, hardcoded rather than reached through a
+#: ``/static/{name}`` path parameter. A parameterised route is one ``..`` away
+#: from serving the repository, and two files are not worth the traversal
+#: guard that would be needed to make it safe.
+_STATIC_FILES: dict[str, str] = {
+    "studio.css": "text/css",
+    "studio.js": "text/javascript",
+}
+
+
+def _static(name: str) -> Response:
+    """Serve one file out of ``public/``, from the function like ``index`` does."""
+    path = _ROOT / "public" / name
+    if not path.is_file():
+        raise HTTPException(404, f"{name} is not part of this build.")
+    return Response(path.read_bytes(), media_type=_STATIC_FILES[name])
+
+
+@app.get("/static/studio.css")
+def studio_css() -> Response:
+    return _static("studio.css")
+
+
+@app.get("/static/studio.js")
+def studio_js() -> Response:
+    return _static("studio.js")
 
 
 @app.get("/", response_class=HTMLResponse)

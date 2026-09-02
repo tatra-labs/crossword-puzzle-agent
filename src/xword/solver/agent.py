@@ -32,13 +32,21 @@ The loop stops when a round produces nothing worth re-asking, when confidence
 crosses a threshold, or when a budget (rounds, API calls, wall clock) runs out.
 It always returns a completely filled grid: an unfilled square scores zero, so a
 low-confidence guess strictly dominates a blank.
+
+A solve can also be stopped from outside, by a ``cancel`` predicate polled at
+the three points that bracket the spending: the top of a round, the moment the
+propose pass returns, and after commit. Stopping hands back the best grid found
+so far rather than nothing -- the caller asked the agent to stop working, not to
+discard work it has already paid Anthropic for.
 """
 
 from __future__ import annotations
 
+import contextlib
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -59,6 +67,13 @@ from xword.core.types import (
     SolveResult,
     SolveStats,
 )
+
+# Typing-only. The agent never builds or reads a record -- it only forwards the
+# caller's observer to the candidate sources, which is where records are made --
+# so importing the type at runtime would buy an import of the web package for a
+# signature annotation.
+if TYPE_CHECKING:
+    from xword.web.trace import LLMCallRecord
 
 # --------------------------------------------------------------------------- #
 # Critique
@@ -103,6 +118,20 @@ def _entry_confidence(
     return float(np.exp(np.mean(np.log(probs))))
 
 
+def _tag_round(source: object, rnd: int) -> None:
+    """Tell a candidate source which round it is answering for.
+
+    ``round_hint`` is a plain int attribute on ``LLMCandidateSource``, read only
+    when it stamps a per-call trace record. But sources are injectable, and the
+    doubles the tests inject are frequently slotted dataclasses where a bare
+    assignment raises ``AttributeError``. Failing a solve in order to label a
+    trace event would be a poor trade, so a source that cannot hold the hint
+    simply does not get one.
+    """
+    with contextlib.suppress(AttributeError, TypeError):
+        source.round_hint = rnd  # type: ignore[attr-defined]
+
+
 # --------------------------------------------------------------------------- #
 # The agent
 # --------------------------------------------------------------------------- #
@@ -113,6 +142,12 @@ class CrosswordAgent:
 
     Construct once and reuse across puzzles: the clue cache, the lexicon, and the
     HTTP connection pool are all worth keeping warm.
+
+    ``cancel`` and ``on_llm_call`` exist for callers that run a solve somewhere
+    the user can still reach it -- the web session runner runs one per thread.
+    ``cancel`` is asked between phases whether to stop; ``on_llm_call`` receives
+    one record per request to the model. Both default to absent, so the CLI and
+    the evaluation harness behave exactly as before.
     """
 
     def __init__(
@@ -122,6 +157,8 @@ class CrosswordAgent:
         lexicon: object | None = None,
         llm: object | None = None,
         on_event: Callable[[AgentEvent], None] | None = None,
+        cancel: Callable[[], bool] | None = None,
+        on_llm_call: Callable[[LLMCallRecord], None] | None = None,
     ) -> None:
         self.config = config or AgentConfig()
         self._lexicon = lexicon
@@ -131,6 +168,8 @@ class CrosswordAgent:
         self._cache = None
         self._usage_base: dict | None = None
         self._on_event = on_event
+        self._cancel = cancel
+        self._on_llm_call = on_llm_call
 
         # Exposed after a solve so the evaluation harness can measure *candidate
         # coverage* -- whether the true answer was ever proposed -- without the
@@ -154,6 +193,11 @@ class CrosswordAgent:
 
         if self._cache is None:
             self._cache = ClueCache(self.config.resolved_cache_path)
+        # Every source this agent builds shares the one clue cache (see
+        # ``hard_llm``) and now also the one trace observer and the one cancel
+        # predicate: a stopped session has to stop the escalation pass too, and
+        # a reader of the trace should not need to know which model answered in
+        # order to find the call.
         return LLMCandidateSource(
             model=model,
             k=self.config.candidates_per_clue,
@@ -161,6 +205,8 @@ class CrosswordAgent:
             max_concurrency=self.config.max_concurrency,
             temperature=self.config.temperature,
             cache=self._cache,
+            on_call=self._on_llm_call,
+            cancel=self._cancel,
         )
 
     @property
@@ -273,6 +319,33 @@ class CrosswordAgent:
         if self._on_event is not None:
             self._on_event(event)
 
+    # -- cancellation ------------------------------------------------------ #
+
+    def _cancelled(self) -> bool:
+        """Whether the caller has asked this solve to stop.
+
+        Polled rather than pushed. The predicate is cheap -- in practice a
+        ``threading.Event.is_set`` -- and polling at phase boundaries means no
+        phase has to be written to be interruptible half way through.
+        """
+        return False if self._cancel is None else bool(self._cancel())
+
+    def _emit_stopped(self, trace: list[AgentEvent], rnd: int, stage: str) -> None:
+        """Record that a stop request, not a budget or a threshold, ended the loop.
+
+        Worth distinguishing in the trace: a reader who sees the loop end after
+        one round needs to know whether the agent decided it was finished or a
+        human pressed the button.
+        """
+        self._emit(
+            trace,
+            "verify",
+            rnd,
+            f"stopped by request during {stage}; returning the best grid so far",
+            stopped=1,
+            stage=stage,
+        )
+
     # -- the loop ---------------------------------------------------------- #
 
     def solve(self, puzzle: Puzzle) -> SolveResult:
@@ -319,6 +392,12 @@ class CrosswordAgent:
         deadline = started + cfg.wall_clock_budget
 
         for rnd in range(max(1, cfg.max_rounds)):
+            # The cheapest possible place to notice: nothing has been spent on
+            # this round yet, so a stop between rounds costs nothing at all.
+            if self._cancelled():
+                self._emit_stopped(trace, rnd, "round start")
+                break
+
             targets = self._targets_for_round(rnd, puzzle, best_assignment, best_bp, trace)
             if rnd > 0 and not targets:
                 self._emit(trace, "critique", rnd, "nothing left worth re-asking; stopping")
@@ -329,6 +408,13 @@ class CrosswordAgent:
             fresh = self._propose(requests, rnd, trace, stats, escalate=rnd > 0)
             beliefs = beliefs.merged_with(fresh) if beliefs.candidates else fresh
             self.last_beliefs = beliefs
+
+            # The merge above is bookkeeping on candidates already paid for, so
+            # it happens before this check. Propagate and commit are seconds of
+            # further work, and not worth doing for a grid nobody is waiting on.
+            if self._cancelled():
+                self._emit_stopped(trace, rnd, "propose")
+                break
 
             # ---- propagate ----------------------------------------------- #
             bp = run_bp(
@@ -382,6 +468,12 @@ class CrosswordAgent:
             stats.rounds = rnd + 1
 
             # ---- stop conditions ----------------------------------------- #
+            # A stop request outranks the budget tests below: each of those
+            # decides whether *more* work is worth doing, and that question is
+            # moot once the answer is no more work at all.
+            if self._cancelled():
+                self._emit_stopped(trace, rnd, "commit")
+                break
             confidence = self._grid_confidence(puzzle, best_assignment, best_bp)
             if confidence >= cfg.stop_when_confident and not best_assignment.conflicts:
                 self._emit(
@@ -399,9 +491,17 @@ class CrosswordAgent:
                 self._emit(trace, "verify", rnd, "wall-clock budget exhausted")
                 break
 
-        assert best_assignment is not None and best_bp is not None
-
-        result = self._finalise(puzzle, best_assignment, best_bp, beliefs, stats, trace, started)
+        if best_assignment is None or best_bp is None:
+            # Every round that gets past ``propose`` reaches ``commit``, so this
+            # branch has exactly one route into it: cancellation inside the
+            # first propose pass, before any grid existed to keep. That is a
+            # user action, and a user action must not surface as an
+            # AssertionError, so it gets its own explicit result.
+            result = self._empty_result(puzzle, beliefs, stats, trace, started)
+        else:
+            result = self._finalise(
+                puzzle, best_assignment, best_bp, beliefs, stats, trace, started
+            )
         self._emit(
             trace,
             "done",
@@ -564,6 +664,10 @@ class CrosswordAgent:
         if self._uses_llm and requests:
             hard_mode = escalate and cfg.escalate_hard_clues
             llm = self.hard_llm if hard_mode else self.llm
+            # Stamp the round on whichever of the two sources is about to run,
+            # so its trace records are attributed to this round rather than to
+            # whatever round the source last answered for.
+            _tag_round(llm, rnd)
             answers = (
                 llm.propose_hard(list(requests)) if hard_mode else llm.propose(list(requests))
             )
@@ -670,6 +774,68 @@ class CrosswordAgent:
         if not conf:
             return 0.0
         return float(np.quantile(np.fromiter(conf.values(), dtype=float), self.WEAKEST_QUANTILE))
+
+    def _empty_result(
+        self,
+        puzzle: Puzzle,
+        beliefs: SlotBeliefs,
+        stats: SolveStats,
+        trace: list[AgentEvent],
+        started: float,
+    ) -> SolveResult:
+        """The result for a solve stopped before it ever committed a grid.
+
+        ``_finalise`` cannot serve this case: it reads ``assignment.fill`` and
+        ``bp.cell_marginals``, and here there is neither an assignment nor a
+        belief-propagation run to read. Handing it invented empty stand-ins
+        would put a fake ``Assignment`` into the one code path that is hardest
+        to exercise, so this is a separate and deliberately dull path instead.
+
+        Empty rather than absent: every entry is reported with ``answer=None``
+        and confidence 0.0, which is what a caller scoring or rendering the
+        result should see for a square nobody guessed. Usage is still applied,
+        because a session cancelled after its first batch went out did cost
+        money and must not report itself as free.
+        """
+        self._apply_usage(stats)
+        stats.wall_seconds = time.perf_counter() - started
+        stats.notes.update(
+            {
+                "cells_filled": 0.0,
+                "cells_total": float(len(puzzle.open_cells)),
+                "entries_from_crossings": 0.0,
+                "mean_cell_confidence": 0.0,
+                "bp_converged": 0.0,
+                "search_score": 0.0,
+                # Not one conflict, because no search ever ran to have one. The
+                # flag below is what tells a reader why the grid is blank.
+                "unresolved": 0.0,
+                "stopped_before_commit": 1.0,
+            }
+        )
+
+        outcomes = {
+            slot.id: SlotOutcome(
+                slot_id=slot.id,
+                clue=slot.clue,
+                answer=None,
+                confidence=0.0,
+                source="none",
+                # Candidates that arrived before the stop are still counted:
+                # they are what the round had already bought.
+                considered=len(beliefs.answers(slot.id)),
+            )
+            for slot in puzzle.slots
+        }
+
+        return SolveResult(
+            puzzle_id=puzzle.id,
+            fill=Fill({}),
+            cell_confidence={},
+            slots=outcomes,
+            stats=stats,
+            trace=trace,
+        )
 
     def _finalise(
         self,

@@ -23,10 +23,29 @@ Probabilities become ``Candidate.score = log(p)``. Downstream fusion works in
 log space and normalises per slot, so the absolute scale does not matter, but
 using the log keeps a 0.9 and a 0.09 candidate a constant distance apart no
 matter which source they came from.
+
+Observability and cancellation
+------------------------------
+Two optional hooks, both plain callables so this module stays ignorant of
+whatever is watching it:
+
+* ``on_call`` receives one :class:`~xword.web.trace.LLMCallRecord` per request
+  -- the system and user text actually sent, the tools offered, the tool call
+  that came back, tokens and latency. Token counts alone cannot answer "what
+  did you ask it and what did it say", which is the only question a trace
+  exists to answer. The record is built inside ``_call``, the one point every
+  request and every retry passes through, so no code path can issue a call
+  without producing one. Batches run concurrently, so the callback is invoked
+  from several threads at once and has to be thread-safe.
+* ``cancel`` is a predicate consulted before anything new is issued. A stopped
+  session must not keep spending credit, but it must also keep the candidates
+  that already arrived, so cancellation only ever suppresses new requests: it
+  never raises, and a partly-filled result is handed back as it stands.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import random
@@ -37,6 +56,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
 from xword.candidates.cache import ClueCache, cache_key, context_digest
 from xword.candidates.prompts import (
@@ -50,6 +70,11 @@ from xword.candidates.prompts import (
 from xword.config import api_key, estimate_cost
 from xword.core.grid import pattern_matches
 from xword.core.types import Candidate, ClueRequest
+
+# ``xword.web.trace`` imports nothing but the standard library (threading, time,
+# dataclasses, typing -- checked, not assumed), so recording calls costs this
+# module no dependency on FastAPI or on anything else the web surface needs.
+from xword.web.trace import LLMCallRecord
 
 #: Floor applied before taking the log, so a model that returns probability 0
 #: yields a very bad score instead of ``-inf``.
@@ -94,6 +119,129 @@ _NON_ALPHA_RE = re.compile(r"[^A-Z]")
 
 def _supports_sampling(model: str) -> bool:
     return not any(model.startswith(prefix) for prefix in _MODELS_WITHOUT_SAMPLING)
+
+
+# --------------------------------------------------------------------------- #
+# Request/response introspection
+# --------------------------------------------------------------------------- #
+#
+# Everything below reads a payload or a response defensively. Both dicts and
+# objects turn up here -- the request payload is plain dicts, ``FakeClient``
+# returns dataclasses, the real SDK returns pydantic models -- and a tracing
+# layer that raised on an unexpected shape would break the solve it exists to
+# describe.
+
+
+def _block_text(block: Any) -> str:
+    """The text of one content block, dict-shaped or object-shaped."""
+    if isinstance(block, str):
+        return block
+    if isinstance(block, Mapping):
+        if block.get("type", "text") != "text":
+            return ""
+        return str(block.get("text", "") or "")
+    if getattr(block, "type", "text") != "text":
+        return ""
+    return str(getattr(block, "text", "") or "")
+
+
+def _content_text(content: Any) -> str:
+    """Content as plain text, whether it is a string or a list of blocks.
+
+    Both shapes are live: :meth:`LLMCandidateSource._request_kwargs` sends
+    ``system`` as a one-element list so it can carry a cache breakpoint but the
+    user turn as a bare string, and a response is a list of mixed blocks.
+    Normalising here rather than at each call site means a later change to any
+    of those cannot turn a trace into an exception.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, (str, Mapping)):
+        return _block_text(content)
+    if isinstance(content, (list, tuple)):
+        return "\n".join(part for part in (_block_text(b) for b in content) if part)
+    return str(content)
+
+
+def _tool_names(tools: Any) -> tuple[str, ...]:
+    """The names of the tools offered, in the order they were sent."""
+    names: list[str] = []
+    for tool in tools or []:
+        name = tool.get("name") if isinstance(tool, Mapping) else getattr(tool, "name", None)
+        if name:
+            names.append(str(name))
+    return tuple(names)
+
+
+def _tool_choice_label(choice: Any) -> str:
+    """``tool_choice`` as something a UI can print: ``tool:submit_answers``."""
+    if choice is None:
+        return ""
+    if isinstance(choice, str):
+        return choice
+    if isinstance(choice, Mapping):
+        kind = str(choice.get("type", "") or "")
+        name = str(choice.get("name", "") or "")
+        return f"tool:{name}" if name else kind
+    return str(choice)
+
+
+def _call_kind(request_kwargs: Mapping[str, Any]) -> str:
+    """``"hard"`` for the analysis pass, ``"batch"`` for the bulk pass.
+
+    Derived from the ``tool_choice`` that was actually sent rather than from a
+    flag threaded down from ``_run``. The two could drift, and if they ever did
+    it is the request that is telling the truth.
+    """
+    choice = request_kwargs.get("tool_choice")
+    if isinstance(choice, Mapping) and choice.get("type") == "auto":
+        return "hard"
+    return "batch"
+
+
+def _first_tool_use(message: Any) -> tuple[str, dict[str, Any]]:
+    """``(name, input)`` of the first tool call in a response, else ``("", {})``.
+
+    Unlike :meth:`LLMCandidateSource._tool_payload` this does not filter by tool
+    name. A call to some other tool, or to none at all, is exactly what a trace
+    should show; a record that agreed with the parser instead of with the
+    response would hide the one thing worth seeing.
+    """
+    for block in getattr(message, "content", None) or []:
+        if isinstance(block, Mapping):
+            if block.get("type") != "tool_use":
+                continue
+            name = str(block.get("name", "") or "")
+            payload: Any = block.get("input")
+        else:
+            if getattr(block, "type", None) != "tool_use":
+                continue
+            name = str(getattr(block, "name", "") or "")
+            payload = getattr(block, "input", None)
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except ValueError:
+                payload = None
+        return name, dict(payload) if isinstance(payload, Mapping) else {}
+    return "", {}
+
+
+def _usage_int(usage: Any, name: str) -> int:
+    """One usage counter, tolerant of a response that does not carry it.
+
+    ``FakeClient`` and older SDK versions omit fields the current API returns,
+    and a missing cache-token count has to read as zero rather than raise.
+    """
+    if usage is None:
+        return 0
+    value = getattr(usage, name, None)
+    if value is None and isinstance(usage, Mapping):
+        value = usage.get(name)
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -148,6 +296,12 @@ class LLMCandidateSource:
     stronger model, build a second source with ``model=cfg.hard_clue_model``.
     Keeping one model per instance is what keeps the usage and cost figures
     attributable.
+
+    ``on_event`` narrates for humans; ``on_call`` records for machines, one
+    :class:`~xword.web.trace.LLMCallRecord` per request. Both are invoked from
+    the batch worker threads, so a subscriber must be thread-safe --
+    ``TraceLog`` is -- and a subscriber that raises loses its event and nothing
+    else.
     """
 
     name = "llm"
@@ -165,6 +319,8 @@ class LLMCandidateSource:
         mode: str = "batch",
         max_retries: int = 4,
         on_event: Callable[[str], None] | None = None,
+        on_call: Callable[[LLMCallRecord], None] | None = None,
+        cancel: Callable[[], bool] | None = None,
     ) -> None:
         self.model = model
         self.k = max(0, int(k))
@@ -175,7 +331,18 @@ class LLMCandidateSource:
         self.mode = mode
         self.max_retries = max(0, int(max_retries))
         self.on_event = on_event
+        self.on_call = on_call
+        self.cancel = cancel
         self.usage = LLMUsage()
+
+        # Which agent round the calls now being issued belong to. An attribute
+        # rather than a parameter: every batch in a round carries the same round
+        # number and the batches run concurrently in a thread pool, so threading
+        # it through propose -> _run -> worker -> _call would widen four
+        # signatures and buy nothing over the agent loop setting it once before
+        # each propose pass. It is advisory -- a stale value mislabels a record,
+        # it cannot affect a solve.
+        self.round_hint: int = 0
 
         self._client = client
         self._client_lock = threading.Lock()
@@ -188,6 +355,32 @@ class LLMCandidateSource:
     def _emit(self, message: str) -> None:
         if self.on_event is not None:
             self.on_event(message)
+
+    def _emit_call(self, record: LLMCallRecord) -> None:
+        """Hand one call record to the subscriber, whatever it does with it.
+
+        Invoked concurrently from the batch pool, so ``on_call`` has to be
+        thread-safe. Exceptions from it are swallowed deliberately: the tracing
+        layer is not allowed to be the thing that fails a solve.
+        """
+        if self.on_call is None:
+            return
+        with contextlib.suppress(Exception):
+            self.on_call(record)
+
+    def _cancelled(self) -> bool:
+        """True when the owner has asked for this solve to stop.
+
+        A predicate that raises is read as "keep going". Losing a running solve
+        to a broken cancellation check would be a worse failure than the one
+        extra call that reading it charitably can cost.
+        """
+        if self.cancel is None:
+            return False
+        try:
+            return bool(self.cancel())
+        except Exception:  # noqa: BLE001 - a broken predicate must not stop work
+            return False
 
     def _get_client(self) -> Any:
         """The Anthropic client, built on first use.
@@ -271,14 +464,89 @@ class LLMCandidateSource:
             jitter = self._rng.uniform(0.0, BACKOFF_JITTER)
         return delay * (1.0 + jitter)
 
-    def _call(self, request_kwargs: dict[str, Any], label: str) -> Any | None:
-        """One API call with exponential backoff; ``None`` once it gives up."""
+    def _sent_fields(
+        self,
+        request_kwargs: Mapping[str, Any],
+        label: str,
+        clue_ids: Sequence[str],
+    ) -> dict[str, Any]:
+        """The "what was sent" half of a record, read back off the payload.
+
+        Read off the payload rather than off the arguments that built it, so the
+        record describes the request that actually went out -- including
+        everything :meth:`_request_kwargs` decided on its own: the forced tool,
+        the disabled thinking, whether this model family accepts a temperature.
+
+        Every message's text is joined rather than only the first user turn. The
+        payload is single-turn today; if that changes the record should grow
+        rather than quietly drop a turn.
+        """
+        messages = request_kwargs.get("messages") or []
+        prompt = "\n\n".join(
+            text
+            for text in (
+                _content_text(m.get("content") if isinstance(m, Mapping) else m)
+                for m in messages
+            )
+            if text
+        )
+        return {
+            "id": uuid4().hex[:12],
+            "label": label,
+            "kind": _call_kind(request_kwargs),
+            "model": str(request_kwargs.get("model") or self.model),
+            "round": self.round_hint,
+            "system": _content_text(request_kwargs.get("system")),
+            "prompt": prompt,
+            "tools": _tool_names(request_kwargs.get("tools")),
+            "tool_choice": _tool_choice_label(request_kwargs.get("tool_choice")),
+            "clue_ids": tuple(clue_ids),
+        }
+
+    def _call(
+        self,
+        request_kwargs: dict[str, Any],
+        label: str,
+        *,
+        clue_ids: Sequence[str] = (),
+    ) -> Any | None:
+        """One API call with exponential backoff; ``None`` once it gives up.
+
+        Also the only place an :class:`~xword.web.trace.LLMCallRecord` is
+        produced, and exactly one is produced per invocation: a request that
+        failed twice and then succeeded is one record with ``attempts=3``, not
+        three records. The UI shows a list of calls, so splitting one logical
+        request across three rows would read as three requests, with the
+        successful one buried under its own failures. A call that never
+        succeeds yields that same single record, carrying the error.
+
+        ``clue_ids`` is passed in because the choke point cannot infer it: the
+        prompt has the slot ids in it, but re-parsing them back out to label a
+        record would be inventing a second source of truth.
+        """
+        # No record for this one: nothing was sent, so there is nothing to show,
+        # and a stopped session already has a "stopping" status event explaining
+        # why its trace ends where it does.
+        if self._cancelled():
+            return None
+
         client = self._get_client()
+        sent = self._sent_fields(request_kwargs, label, clue_ids)
+        started_at = time.time()
+        clock = time.perf_counter()
         last: BaseException | None = None
+        cancelled = False
+        attempts = 0
+
         for attempt in range(self.max_retries + 1):
+            if attempt and self._cancelled():
+                # A retry is a new request, so a stop stops it too.
+                cancelled = True
+                break
+            attempts = attempt + 1
             try:
                 message = client.messages.create(**request_kwargs)
-            except BaseException as exc:  # noqa: BLE001 - re-raised below
+            except BaseException as exc:  # noqa: BLE001 - recorded below
                 if not self._is_retryable(exc) or attempt == self.max_retries:
                     last = exc
                     break
@@ -292,11 +560,44 @@ class LLMCandidateSource:
                 time.sleep(delay)
                 continue
             self._record_usage(calls=1)
-            self._record_tokens(getattr(message, "usage", None))
+            raw_usage = getattr(message, "usage", None)
+            self._record_tokens(raw_usage)
+            tool_name, tool_input = _first_tool_use(message)
+            self._emit_call(
+                LLMCallRecord.build(
+                    **sent,
+                    stop_reason=str(getattr(message, "stop_reason", "") or ""),
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                    text=_content_text(getattr(message, "content", None)),
+                    started_at=started_at,
+                    duration_s=time.perf_counter() - clock,
+                    input_tokens=_usage_int(raw_usage, "input_tokens"),
+                    output_tokens=_usage_int(raw_usage, "output_tokens"),
+                    cache_read_tokens=_usage_int(raw_usage, "cache_read_input_tokens"),
+                    cache_write_tokens=_usage_int(raw_usage, "cache_creation_input_tokens"),
+                    attempts=attempts,
+                )
+            )
             return message
 
-        self._record_usage(failures=1)
-        self._emit(f"{label}: giving up after {self.max_retries} retries ({last!r})")
+        if cancelled:
+            # Not counted as a failure: nothing failed, the session was stopped.
+            error = "cancelled: a stop was requested before the retry"
+            self._emit(f"{label}: stopped, not retrying")
+        else:
+            self._record_usage(failures=1)
+            error = f"{type(last).__name__}: {last}" if last is not None else "no response"
+            self._emit(f"{label}: giving up after {self.max_retries} retries ({last!r})")
+        self._emit_call(
+            LLMCallRecord.build(
+                **sent,
+                started_at=started_at,
+                duration_s=time.perf_counter() - clock,
+                attempts=attempts,
+                error=error,
+            )
+        )
         return None
 
     # -- request construction ---------------------------------------------- #
@@ -466,6 +767,7 @@ class LLMCandidateSource:
 
         mode = "hard" if hard else self.mode
         pending: list[ClueRequest] = []
+        cached_ids: list[str] = []
         for slot_id, request in unique.items():
             hit = None
             if self.cache is not None:
@@ -481,12 +783,34 @@ class LLMCandidateSource:
                 )
             if hit is not None:
                 results[slot_id] = list(hit)
+                cached_ids.append(slot_id)
                 with self._usage_lock:
                     self.usage.cache_hits += 1
             else:
                 pending.append(request)
                 with self._usage_lock:
                     self.usage.cache_misses += 1
+
+        if cached_ids and self.on_call is not None:
+            # Without this the trace has an unexplained hole in it: entries that
+            # were never asked about, because the answer was already on disk.
+            # One record for the whole cached subset rather than one per clue --
+            # on a warm run the latter would bury the real calls under dozens of
+            # non-calls.
+            self._emit_call(
+                LLMCallRecord.build(
+                    id=uuid4().hex[:12],
+                    label="cache hit",
+                    kind="cache",
+                    model=self.model,
+                    round=self.round_hint,
+                    system="",
+                    prompt="",
+                    clue_ids=tuple(cached_ids),
+                    started_at=time.time(),
+                    cached=True,
+                )
+            )
 
         if not pending:
             self._emit(f"{len(unique)} clues, all cached")
@@ -516,7 +840,7 @@ class LLMCandidateSource:
                 # deterministic regardless of which call returns first.
                 merged = list(pool.map(worker, batches))
 
-        for batch, produced in zip(batches, merged):
+        for batch, produced in zip(batches, merged, strict=True):
             for request in batch:
                 candidates = produced.get(request.slot_id, [])
                 results[request.slot_id] = candidates
@@ -539,6 +863,11 @@ class LLMCandidateSource:
         return results
 
     def _run_batch(self, batch: Sequence[ClueRequest]) -> dict[str, list[Candidate]]:
+        # Checked here as well as in ``_call``: when a stop arrives most batches
+        # of a wide puzzle are still queued in the pool, and this is where they
+        # get to exit without building a prompt or spending anything.
+        if self._cancelled():
+            return {r.slot_id: [] for r in batch}
         meta: Mapping[str, str] = batch[0].puzzle_meta if batch else {}
         kwargs = self._request_kwargs(
             system=SYSTEM_PROMPT,
@@ -546,7 +875,7 @@ class LLMCandidateSource:
             hard=False,
         )
         label = f"batch[{batch[0].slot_id}..{batch[-1].slot_id}]"
-        message = self._call(kwargs, label)
+        message = self._call(kwargs, label, clue_ids=[r.slot_id for r in batch])
         if message is None:
             return {r.slot_id: [] for r in batch}
         return self._parse_batch(message, batch)
@@ -555,6 +884,8 @@ class LLMCandidateSource:
         self, batch: Sequence[ClueRequest]
     ) -> dict[str, list[Candidate]]:
         request = batch[0]
+        if self._cancelled():
+            return {request.slot_id: []}
         kwargs = self._request_kwargs(
             system=HARD_SYSTEM_PROMPT,
             user=build_hard_prompt(
@@ -562,7 +893,9 @@ class LLMCandidateSource:
             ),
             hard=True,
         )
-        message = self._call(kwargs, f"hard[{request.slot_id}]")
+        message = self._call(
+            kwargs, f"hard[{request.slot_id}]", clue_ids=[request.slot_id]
+        )
         if message is None:
             return {request.slot_id: []}
         return self._parse_batch(message, [request])
