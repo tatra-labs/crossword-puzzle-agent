@@ -125,6 +125,19 @@ or export it in your shell. A shell variable always wins over the file.
 
 ---
 
+## Deploying the web demo
+
+There is a FastAPI surface (`app.py`) and a demo page (`public/index.html`) that
+stream the agent's trace while it solves. Import the repo in Vercel, set
+`ANTHROPIC_API_KEY`, and **enable Fluid Compute** — without it the 10s Hobby
+function ceiling kills every solve but the smallest mini, since a 15x15 measures
+116-216s.
+
+Full walkthrough, including the timeout table, the cost/access-control warning
+and what is degraded versus running locally: **[docs/DEPLOY.md](docs/DEPLOY.md)**.
+
+---
+
 ## Using it
 
 ### Solve a puzzle

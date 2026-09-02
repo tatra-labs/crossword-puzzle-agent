@@ -46,7 +46,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
 import numpy as np
-from scipy.stats import binomtest
 
 from xword.core.types import WILDCARD, Cell, Puzzle, SolveResult
 
@@ -727,8 +726,30 @@ def mcnemar(
     discordant = a_only + b_only
     if discordant == 0:
         return a_only, b_only, 1.0
-    result = binomtest(a_only, discordant, 0.5, alternative="two-sided")
-    return a_only, b_only, float(result.pvalue)
+    return a_only, b_only, _two_sided_binomial(a_only, discordant)
+
+
+def _two_sided_binomial(successes: int, trials: int) -> float:
+    """Exact two-sided binomial p-value at p = 0.5.
+
+    SciPy's ``binomtest`` is used when it is installed, but it is imported
+    lazily and has a stdlib fallback: it is a ~100 MB dependency pulled in here
+    for one call, which matters when this module is bundled into a serverless
+    function whose only use of it is scoring a solved grid.
+
+    The fallback is exact rather than approximate. Under p = 0.5 the
+    distribution is symmetric, so doubling the smaller tail is the exact
+    two-sided probability -- the case where a normal approximation or a
+    general-p implementation would differ does not arise.
+    """
+    try:
+        from scipy.stats import binomtest  # noqa: PLC0415 - optional dependency
+
+        return float(binomtest(successes, trials, 0.5, alternative="two-sided").pvalue)
+    except ImportError:
+        k = min(successes, trials - successes)
+        tail = sum(math.comb(trials, i) for i in range(k + 1)) / (2.0**trials)
+        return min(1.0, 2.0 * tail)
 
 
 def paired_bootstrap(

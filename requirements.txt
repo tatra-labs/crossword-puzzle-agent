@@ -1,0 +1,12 @@
+# Runtime dependencies for the Vercel deployment (see app.py).
+#
+# Deliberately narrower than pyproject.toml's set: the web surface needs the
+# agent, not the CLI or the statistics stack. scipy is ~100 MB and metrics.py
+# now falls back to an exact stdlib binomial without it; typer and tqdm are
+# CLI-only. Python functions get no tree-shaking, so what is listed here is
+# what ships.
+fastapi>=0.117.1
+anthropic>=0.40
+numpy>=1.26
+httpx>=0.27
+rich>=13.0

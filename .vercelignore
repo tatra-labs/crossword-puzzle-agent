@@ -1,0 +1,21 @@
+# NEVER upload secrets. The API key is supplied as a Vercel environment
+# variable, not from a file in the bundle.
+.env
+*.key
+
+# Third-party corpora and build artefacts (see .gitignore for why).
+data/puzzles/nyt/
+data/lexicon/
+.xword-cache/
+reports/
+
+# Not needed to serve requests.
+tests/
+docs/
+scripts/
+.git/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+src/*.egg-info/

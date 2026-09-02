@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crossword Agent</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfaf8; --panel: #ffffff; --ink: #16151a; --muted: #6b6a73;
+    --line: #dedce0; --block: #2b2a30; --accent: #3d5aa9;
+    --good: #1f7a4d; --bad: #b3261e; --warn: #9a6b12;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #131316; --panel: #1b1b20; --ink: #eceaf0; --muted: #9d9ba6;
+      --line: #33323a; --block: #4a4954; --accent: #8ea6ee;
+      --good: #5cc98d; --bad: #f0837c; --warn: #dcb257;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 28px 20px 60px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); margin: 0 0 22px; }
+  .sub code { font-family: var(--mono); font-size: .85em; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 16px; margin-bottom: 16px;
+  }
+  .controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+  label { display: block; font-size: .78rem; color: var(--muted); margin-bottom: 4px; }
+  select, button {
+    font: inherit; padding: 8px 12px; border-radius: 7px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+  }
+  button {
+    background: var(--accent); color: #fff; border-color: transparent;
+    cursor: pointer; font-weight: 600;
+  }
+  button:disabled { opacity: .55; cursor: default; }
+  .cols { display: grid; grid-template-columns: minmax(0,auto) minmax(0,1fr); gap: 18px; align-items: start; }
+  @media (max-width: 760px) { .cols { grid-template-columns: 1fr; } }
+  table.grid { border-collapse: collapse; }
+  table.grid td {
+    width: 34px; height: 34px; border: 1px solid var(--line);
+    text-align: center; vertical-align: middle; position: relative;
+    font-family: var(--mono); font-size: 16px; font-weight: 600;
+    background: var(--panel);
+  }
+  table.grid td.block { background: var(--block); border-color: var(--block); }
+  table.grid td .num {
+    position: absolute; top: 1px; left: 2px;
+    font-size: 8px; font-weight: 500; color: var(--muted);
+  }
+  .legend { color: var(--muted); font-size: .8rem; margin-top: 8px; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin: 0 4px 2px 10px; }
+  #trace {
+    font-family: var(--mono); font-size: .78rem; line-height: 1.5;
+    max-height: 320px; overflow-y: auto; margin: 0; white-space: pre-wrap;
+  }
+  #trace .k { color: var(--accent); font-weight: 600; }
+  #trace .r { color: var(--muted); }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px,1fr)); gap: 10px; }
+  .stat { border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; }
+  .stat b { display: block; font-size: 1.05rem; font-family: var(--mono); }
+  .stat span { font-size: .72rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .note { border-left: 3px solid var(--warn); padding: 8px 12px; color: var(--muted); font-size: .85rem; background: var(--panel); border-radius: 0 7px 7px 0; }
+  .err { border-left-color: var(--bad); color: var(--bad); }
+  .entries { width: 100%; border-collapse: collapse; font-size: .82rem; }
+  .entries th { text-align: left; color: var(--muted); font-weight: 500; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+  .entries td { padding: 3px 8px; border-bottom: 1px solid var(--line); }
+  .entries td.a { font-family: var(--mono); }
+  .ok { color: var(--good); } .no { color: var(--bad); }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Crossword Agent</h1>
+  <p class="sub">
+    An LLM reads the clues; belief propagation and search make the grid agree with itself;
+    a self-critique loop re-asks only the entries it distrusts.
+    <a href="https://github.com/tatra-labs/crossword-puzzle-agent">source</a> ·
+    <a href="/api/docs">API</a>
+  </p>
+
+  <div class="card">
+    <div class="controls">
+      <div>
+        <label for="puzzle">Puzzle</label>
+        <select id="puzzle"></select>
+      </div>
+      <div>
+        <label for="rounds">Max rounds</label>
+        <select id="rounds">
+          <option value="1">1 (no repair)</option>
+          <option value="3" selected>3</option>
+          <option value="4">4</option>
+        </select>
+      </div>
+      <button id="go">Solve</button>
+    </div>
+    <p class="legend" id="limits"></p>
+  </div>
+
+  <div id="problem" hidden></div>
+
+  <div class="cols">
+    <div>
+      <div class="card" id="gridCard" hidden>
+        <div id="grid"></div>
+        <div class="legend" id="gridLegend"></div>
+      </div>
+    </div>
+    <div>
+      <div class="card" id="traceCard" hidden>
+        <label>Agent trace</label>
+        <pre id="trace"></pre>
+      </div>
+      <div class="card" id="statsCard" hidden>
+        <div class="stats" id="stats"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" id="entriesCard" hidden>
+    <label>Entries</label>
+    <div style="max-height:340px;overflow-y:auto">
+      <table class="entries" id="entries"></table>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let health = null;
+
+function ramp(p) {
+  // Confidence ramp chosen to stay legible in both themes: we tint the cell
+  // background lightly rather than recolouring the letter, so low-confidence
+  // squares read as "unsettled" without hurting contrast.
+  if (p == null) return "transparent";
+  if (p >= 0.95) return "transparent";
+  if (p >= 0.8)  return "color-mix(in srgb, var(--warn) 12%, transparent)";
+  if (p >= 0.5)  return "color-mix(in srgb, var(--warn) 26%, transparent)";
+  return "color-mix(in srgb, var(--bad) 26%, transparent)";
+}
+
+function drawGrid(d) {
+  const rows = d.fill, gold = d.gold || null, conf = d.confidence || {};
+  const nums = d.puzzle.numbers || {};
+  const t = document.createElement("table");
+  t.className = "grid";
+  rows.forEach((row, r) => {
+    const tr = document.createElement("tr");
+    [...row].forEach((ch, c) => {
+      const td = document.createElement("td");
+      if (ch === "#") { td.className = "block"; }
+      else {
+        const key = r + "," + c;
+        const p = conf[key];
+        td.style.background = ramp(p);
+        td.textContent = ch === "?" ? "" : ch;
+        if (nums[key]) {
+          const n = document.createElement("span");
+          n.className = "num"; n.textContent = nums[key];
+          td.appendChild(n);
+        }
+        if (gold) {
+          const want = gold[r][c];
+          if (ch !== want) {
+            td.classList.add("no");
+            td.style.background = "color-mix(in srgb, var(--bad) 30%, transparent)";
+            td.title = "expected " + want;
+          } else {
+            td.classList.add("ok");
+          }
+        }
+        td.title = (td.title ? td.title + " · " : "") +
+                   "confidence " + (p == null ? "n/a" : (p * 100).toFixed(1) + "%");
+      }
+      tr.appendChild(td);
+    });
+    t.appendChild(tr);
+  });
+  $("grid").replaceChildren(t);
+  $("gridCard").hidden = false;
+  $("gridLegend").innerHTML = d.score
+    ? `<b>${d.score.solved ? "Solved" : "Not solved"}</b> · ${d.score.cells_correct}/${d.score.cells_total} squares
+       · ${d.score.words_correct}/${d.score.words_total} entries
+       <span class="swatch" style="background:var(--good)"></span>correct
+       <span class="swatch" style="background:var(--bad)"></span>wrong`
+    : `<span class="swatch" style="background:color-mix(in srgb,var(--bad) 30%,transparent)"></span>low confidence
+       <span class="swatch" style="background:color-mix(in srgb,var(--warn) 26%,transparent)"></span>medium`;
+}
+
+function drawStats(s, score) {
+  const items = [
+    ["rounds", s.rounds], ["API calls", s.llm_calls],
+    ["tokens in", s.input_tokens.toLocaleString()],
+    ["tokens out", s.output_tokens.toLocaleString()],
+    ["est. cost", "$" + s.cost_usd.toFixed(4)],
+    ["wall time", s.wall_seconds.toFixed(1) + "s"],
+  ];
+  if (score) items.unshift(["cell acc", (score.cell_accuracy * 100).toFixed(1) + "%"]);
+  $("stats").innerHTML = items
+    .map(([k, v]) => `<div class="stat"><b>${v}</b><span>${k}</span></div>`).join("");
+  $("statsCard").hidden = false;
+}
+
+function drawEntries(list) {
+  const head = "<tr><th></th><th>Clue</th><th>Answer</th><th>Conf</th><th>Source</th></tr>";
+  const body = list.map(e => {
+    const mark = e.gold == null ? "" : (e.answer === e.gold
+      ? '<span class="ok">&#10003;</span>'
+      : `<span class="no">&#10007;</span>`);
+    const ans = e.gold != null && e.answer !== e.gold
+      ? `<s>${e.answer ?? ""}</s> ${e.gold}` : (e.answer ?? "");
+    return `<tr><td>${mark} ${e.id}</td><td>${escapeHtml(e.clue)}</td>
+            <td class="a">${ans}</td><td>${(e.confidence*100).toFixed(0)}%</td>
+            <td>${e.source}</td></tr>`;
+  }).join("");
+  $("entries").innerHTML = head + body;
+  $("entriesCard").hidden = false;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+}
+
+function say(msg, isErr) {
+  $("problem").hidden = false;
+  $("problem").innerHTML = `<p class="note ${isErr ? "err" : ""}">${escapeHtml(msg)}</p>`;
+}
+
+function trace(kind, round, message) {
+  const line = document.createElement("div");
+  line.innerHTML = `<span class="r">r${round}</span> <span class="k">${kind.padEnd(9)}</span> ${escapeHtml(message)}`;
+  $("trace").appendChild(line);
+  $("trace").scrollTop = $("trace").scrollHeight;
+  $("traceCard").hidden = false;
+}
+
+async function boot() {
+  try {
+    health = await (await fetch("/api/health")).json();
+    const list = await (await fetch("/api/puzzles")).json();
+    const sel = $("puzzle");
+    sel.innerHTML = list.puzzles.map(p =>
+      `<option value="${p.id}" ${p.fits_here ? "" : "disabled"}>${p.id} — ${p.size}, ${p.entries} entries${p.fits_here ? "" : " (too big)"}</option>`
+    ).join("");
+    $("limits").textContent =
+      `Function limit ${health.function_max_seconds}s, solve budget ${health.solve_budget_seconds}s. ` +
+      `Lexicon ${health.lexicon_entries.toLocaleString()} entries${health.lexicon_is_fallback ? " (built-in fallback)" : ""}. ` +
+      `Model ${health.model}.`;
+    if (!health.api_key_configured) {
+      say("ANTHROPIC_API_KEY is not set on this deployment, so solving is disabled. " +
+          "Add it in the Vercel project's Environment Variables and redeploy.", true);
+      $("go").disabled = true;
+    }
+  } catch (e) {
+    say("Could not reach the API: " + e.message, true);
+  }
+}
+
+$("go").addEventListener("click", async () => {
+  $("go").disabled = true;
+  $("problem").hidden = true;
+  $("trace").replaceChildren();
+  $("gridCard").hidden = $("statsCard").hidden = $("entriesCard").hidden = true;
+  const body = JSON.stringify({
+    puzzle: $("puzzle").value,
+    rounds: parseInt($("rounds").value, 10),
+  });
+  try {
+    const res = await fetch("/api/solve/stream", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body,
+    });
+    if (!res.ok) { say((await res.json()).detail || res.statusText, true); return; }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const frames = buf.split("\n\n");
+      buf = frames.pop();
+      for (const frame of frames) {
+        const ev = /^event: (.+)$/m.exec(frame);
+        const da = /^data: (.+)$/m.exec(frame);
+        if (!ev || !da) continue;
+        const data = JSON.parse(da[1]);
+        if (ev[1] === "event") trace(data.kind, data.round, data.message);
+        else if (ev[1] === "error") say(data.message, true);
+        else if (ev[1] === "result") {
+          drawGrid(data); drawStats(data.stats, data.score); drawEntries(data.entries);
+        }
+      }
+    }
+  } catch (e) {
+    say("Solve failed: " + e.message, true);
+  } finally {
+    $("go").disabled = false;
+  }
+});
+
+boot();
+</script>
+</body>
+</html>
