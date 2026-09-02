@@ -22,6 +22,7 @@ from __future__ import annotations
 import html
 import json
 import math
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from random import Random
@@ -612,15 +613,25 @@ def summarise(run: EvalRun, *, bootstrap: int = 2000, seed: int = 0) -> dict:
 
 
 def _command(summary: Mapping[str, Any]) -> str:
-    """The canonical CLI invocation that reproduces this run."""
+    """The canonical CLI invocation that reproduces this run.
+
+    Written to be *runnable*, which is not automatic: ``eval`` is a Typer
+    sub-app, so the verb (``eval run``) is required; a suite spec like
+    ``nyt:14`` cannot go straight into a path because ``:`` is illegal in a
+    Windows filename; and the suite name needs quoting so a shell does not
+    reinterpret it. A reproducibility footer that does not actually reproduce
+    the run is worse than none, because nobody checks it until it matters.
+    """
     systems = ",".join(summary.get("systems") or ["full"])
+    suite = str(summary.get("suite", "bundled"))
+    out_dir = re.sub(r"[^A-Za-z0-9._-]+", "-", suite).strip("-") or "run"
     return (
-        "PYTHONPATH=src python -m xword.cli eval "
-        f"--suite {summary.get('suite', 'bundled')} "
+        "xword eval run "
+        f'--suite "{suite}" '
         f"--systems {systems} "
         f"--seed {summary.get('seed', 0)} "
         f"--workers {summary.get('workers', 1)} "
-        f"--out reports/{summary.get('suite', 'run')}"
+        f"--out reports/{out_dir}"
     )
 
 

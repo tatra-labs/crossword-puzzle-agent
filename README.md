@@ -45,6 +45,57 @@ Evaluation methodology: **[docs/EVALUATION.md](docs/EVALUATION.md)**.
 
 ---
 
+## Does it work?
+
+14 real New York Times puzzles, stratified two per weekday (so Saturdays and
+Sundays count as much as Mondays), Claude Sonnet 5, seed 0:
+
+| System | Exact solve rate (95% CI) | Cell acc | Word acc | $/puzzle | s/puzzle |
+|---|---|---|---|---|---|
+| **`full`** (the agent) | **50.0%** [21.4, 78.6] | 96.8% | 94.1% | $0.65 | 216 |
+| `greedy-llm` (prompt the model, take its top answer) | **0.0%** [0.0, 0.0] | 71.2% | 49.3% | $0.04 | 9 |
+
+The gap is the whole point of the project: same model, same clues, and the
+scaffolding turns 0 solved puzzles into 7 of 14. McNemar's exact test on the 7
+discordant puzzles gives **p = 0.016** (Holm-adjusted 0.016). Word accuracy
+nearly doubles, 49.3% → 94.1%.
+
+Solve rate by day of week tracks the difficulty gradient you would expect —
+Mon 100%, Wed 100%, Tue/Thu/Sat 50%, Fri 0%, Sun 0% (n=2 each, so these are
+directional only).
+
+Confidence is worth reading: expected calibration error 3.8%, and selective
+accuracy rises monotonically from 95.5% at 98% coverage to 97.7% at 92%
+coverage — the agent's uncertainty points at the squares that are actually
+wrong.
+
+Full report, including the reliability table, failure taxonomy and the ten
+entries it missed: **[docs/sample-evaluation-report.md](docs/sample-evaluation-report.md)**.
+
+### How to read these numbers honestly
+
+Three caveats, all of which matter:
+
+1. **n = 14.** [docs/EVALUATION.md §6](docs/EVALUATION.md) works out that a
+   defensible ablation claim needs ~150 puzzles. The `full` vs `greedy-llm` gap
+   is large enough to clear significance anyway; the per-weekday rows are not,
+   and the solve-rate CI is 57 points wide. This is a demonstration that the
+   harness works on real data, not a benchmark result.
+2. **Contamination.** Every puzzle predates 2019 and has been on the public web
+   for years, so the model has very likely seen many of these clue/answer pairs
+   in pretraining. **These are an upper bound on performance against fresh
+   puzzles.** [§4](docs/EVALUATION.md) sets out the probes that size the effect.
+3. **Provenance.** Measured at commit `90e493e`. Three later commits fix
+   accuracy defects found by an adversarial review of this code — most
+   significantly, belief propagation was applying the English letter prior once
+   per crossing entry instead of once per square, which cost up to 10 points of
+   letter accuracy in a 12-regime sweep and roughly doubled calibration error.
+   The shipped code is therefore *better* than the table above, not worse, but
+   the table was not re-measured against it. `xword eval run --suite nyt:14
+   --systems full,greedy-llm --seed 0` reproduces it on the current code.
+
+---
+
 ## Quick start
 
 ```bash
